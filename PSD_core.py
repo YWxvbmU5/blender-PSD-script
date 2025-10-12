@@ -163,30 +163,6 @@ def _euler_deg_to_quat(rot_deg):
     ex, ey, ez = rot_deg
     return Euler((math.radians(ex), math.radians(ey), math.radians(ez)), 'XYZ').to_quaternion()
 
-def _angle_from_quat(q: Quaternion):
-    """返回四元数表示的旋转角度（绝对值，度）。"""
-    w = max(-1.0, min(1.0, q.w))
-    ang = 2.0 * math.degrees(math.acos(w))
-    # 角度归一到 [0, 360]
-    if ang < 0:
-        ang += 360.0
-    return abs(ang)
-
-def rotation_between_vectors(a: Vector, b: Vector) -> Quaternion:
-    """计算从向量 a 到向量 b 的最短旋转四元数。"""
-    a = a.normalized()
-    b = b.normalized()
-    dot = a.dot(b)
-    if dot > 0.99999:
-        return Quaternion((1.0, 0.0, 0.0, 0.0))
-    if dot < -0.99999:
-        # 相反方向：找一个垂直轴进行180度旋转
-        axis = a.orthogonal().normalized()
-        return Quaternion(axis, math.pi)
-    cross = a.cross(b).normalized()
-    angle = math.acos(dot)
-    return Quaternion(cross, angle)
-
 def _swing_twist_decompose(q: Quaternion, twist_axis: Vector):
     """把 q 分解为 swing 和 twist，其中 swing 是将 twist_axis 定向到其最终方向的最短旋转，然后 twist 是围绕该轴的剩余旋转。
     返回 (swing_quat, twist_quat)，顺序为 q = twist @ swing (先 swing 后 twist)。
@@ -503,7 +479,7 @@ def _psd_compute_all(depsgraph=None):
                                 else:
                                     w = 0.0
 
-                            # 否则，如果用户选择了旋转通道模式 -> 使用四元数的摇摆-扭转分解
+                            # 否则，如果用户选择了旋转通道模式 ->
                             elif getattr(entry, 'rot_channel_mode', 'NONE') and entry.rot_channel_mode != 'NONE':
                                 try:
                                     # 把保存的 rest/pose/current 欧拉都转成四元数
@@ -515,7 +491,7 @@ def _psd_compute_all(depsgraph=None):
                                     q_target = q_rest.inverted() @ q_pose
                                     q_cur_rel = q_rest.inverted() @ q_cur
 
-                                    # 选择扭转轴（局部轴）
+                                    # 选择扭转轴（局部轴） —— 保留 axis 向量
                                     axis_map = {
                                         'SWING_X_TWIST': Vector((1.0, 0.0, 0.0)),
                                         'SWING_Y_TWIST': Vector((0.0, 1.0, 0.0)),
@@ -523,15 +499,18 @@ def _psd_compute_all(depsgraph=None):
                                     }
                                     axis = axis_map.get(entry.rot_channel_mode, Vector((0.0, 0.0, 1.0)))
 
-                                    # 分解并获取角度
-                                    swing_t, twist_t = _swing_twist_decompose(q_target, axis)
-                                    swing_c, twist_c = _swing_twist_decompose(q_cur_rel, axis)
-                                    target_twist_angle = _signed_angle_from_quat(twist_t, axis)
-                                    cur_twist_angle = _signed_angle_from_quat(twist_c, axis)
+                                    # --- 替换为基于 Euler 分量差的 twist 量（度） ---
+                                    axis_idx_map = {'SWING_X_TWIST': 0, 'SWING_Y_TWIST': 1, 'SWING_Z_TWIST': 2}
+                                    axis_idx = axis_idx_map.get(entry.rot_channel_mode, 2)
 
-                                    # 使用三角包络映射（与原逻辑相似）分别给出 twist/swing 的相似度，再相乘
+                                    # 注意：entry.rest_rot / entry.pose_rot 是 FloatVectorProperty；cur_rot 来源于采样（Vector）
+                                    target_twist_angle = float(entry.pose_rot[axis_idx] - entry.rest_rot[axis_idx])
+                                    cur_twist_angle = float(cur_rot[axis_idx] - entry.rest_rot[axis_idx])
+
+                                    # 三角包络映射
                                     w_twist = _triangular_ratio(cur_twist_angle, target_twist_angle)
                                     w = float(max(0.0, min(1.0, w_twist)))
+
 
                                 except Exception:
                                     # 回退到旧的向量投影法
