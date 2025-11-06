@@ -143,7 +143,7 @@ def _capture_bone_local_translation(arm_obj, bone_name, depsgraph=None):
     if not pb:
         raise RuntimeError(f"在对象 '{source_obj.name}' 上找不到姿态骨骼 '{bone_name}'")
 
-    rest_loc = Vector((0.0, 0.0, 0.0))
+    rest_loc = pb.location.copy()
     pose_loc = pb.location.copy()
     return (rest_loc, pose_loc)
 
@@ -899,24 +899,49 @@ def _psd_compute_all(depsgraph=None):
                                 # 修改版：逐轴类PSD衰减，忽略pose_loc[i]≈0的轴
                                 w_loc = 1.0
                                 num_nonzero = 0
+
+                                # 取出rest与pose（都应以 tuple/list 存在 entry）
+                                rest_vec = Vector(getattr(entry, 'rest_loc', (0.0, 0.0, 0.0)))
+                                pose_vec = Vector(getattr(entry, 'pose_loc', (0.0, 0.0, 0.0)))
                                 for i in range(3):
-                                    pose_comp = center[i]
-                                    if abs(pose_comp) < 1e-6:
-                                        continue  # 忽略此轴
+                                    rest_comp = rest_vec[i]
+                                    pose_comp = pose_vec[i]
                                     cur_comp = cur_loc[i]
-                                    # 计算标量投影（假设有方向性）
-                                    w_i = cur_comp / pose_comp if pose_comp != 0 else 0.0
+
+                                    denom = (pose_comp - rest_comp)
+                                    # 如果 rest 与 pose 在该轴上几乎相同 -> 无法根据该轴判断，跳过
+                                    if abs(denom) < 1e-8:
+                                        # 若 cur 与 rest 也几乎相同 -> 视为完全匹配该轴（w_i = 1）
+                                        if abs(cur_comp - rest_comp) < 1e-6:
+                                            # treat as neutral (multiply by 1)
+                                            num_nonzero += 1
+                                            continue
+                                        else:
+                                            # 这一轴无法贡献权重（跳过），但不把整个 w_loc 归零
+                                            continue
+
+                                    # 投影到 rest->pose 线段，得到标量比例
+                                    w_i = (cur_comp - rest_comp) / denom
+
+                                    # 原来逻辑：负数 -> 0； >2 -> 0； 1..2 -> 对称映射 2 - w_i
+                                    if math.isnan(w_i):
+                                        w_i = 0.0
                                     if w_i < 0.0:
                                         w_i = 0.0
                                     elif w_i > 2.0:
                                         w_i = 0.0
                                     elif w_i > 1.0:
                                         w_i = 2.0 - w_i
+
+                                    # 保证数值稳定
+                                    w_i = max(0.0, min(1.0, w_i))
+
                                     w_loc *= w_i
                                     num_nonzero += 1
+
+                                # 如果所有轴都被视为“几乎不可判定”（num_nonzero==0），则退回到精确匹配判断
                                 if num_nonzero == 0:
-                                    # 所有轴均为零：在零点精确匹配
-                                    w_loc = 1.0 if cur_loc.length < 1e-6 else 0.0
+                                    w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
 
                             if math.isnan(w_loc):
                                 w_loc = 0.0
