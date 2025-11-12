@@ -903,40 +903,31 @@ def _psd_compute_all(depsgraph=None):
                                 # 取出rest与pose（都应以 tuple/list 存在 entry）
                                 rest_vec = Vector(getattr(entry, 'rest_loc', (0.0, 0.0, 0.0)))
                                 pose_vec = Vector(getattr(entry, 'pose_loc', (0.0, 0.0, 0.0)))
-                                for i in range(3):
-                                    rest_comp = rest_vec[i]
-                                    pose_comp = pose_vec[i]
-                                    cur_comp = cur_loc[i]
+                                # 使用向量投影来计算一个整体的权重 w_loc
+                                direction = pose_vec - rest_vec
+                                len2 = direction.length_squared
 
-                                    denom = (pose_comp - rest_comp)
-                                    # 如果 rest 与 pose 在该轴上几乎相同 -> 无法根据该轴判断，跳过
-                                    if abs(denom) < 1e-8:
-                                        # 若 cur 与 rest 也几乎相同 -> 视为完全匹配该轴（w_i = 1）
-                                        if abs(cur_comp - rest_comp) < 1e-6:
-                                            # treat as neutral (multiply by 1)
-                                            num_nonzero += 1
-                                            continue
-                                        else:
-                                            # 这一轴无法贡献权重（跳过），但不把整个 w_loc 归零
-                                            continue
+                                if len2 < 1e-12:
+                                    # pose 与 rest 几乎相同，退回到距离精确匹配判断
+                                    w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
+                                else:
+                                    # t 是 cur 在 rest->pose 线段上的比例（可以小于0或大于1）
+                                    t = (cur_loc - rest_vec).dot(direction) / len2
 
-                                    # 投影到 rest->pose 线段，得到标量比例
-                                    w_i = (cur_comp - rest_comp) / denom
+                                    if math.isnan(t):
+                                        t = 0.0
 
-                                    # 原来逻辑：负数 -> 0； >2 -> 0； 1..2 -> 对称映射 2 - w_i
-                                    if math.isnan(w_i):
-                                        w_i = 0.0
-                                    if w_i < 0.0:
-                                        w_i = 0.0
-                                    elif w_i > 2.0:
-                                        w_i = 0.0
-                                    elif w_i > 1.0:
-                                        w_i = 2.0 - w_i
+                                    # 原逻辑映射： <0 ->0 ; >2 ->0 ; 1..2 -> 2 - t ; 0..1 -> t
+                                    if t < 0.0 or t > 2.0:
+                                        w_loc = 0.0
+                                    elif t > 1.0:
+                                        w_loc = 2.0 - t
+                                    else:
+                                        w_loc = t
 
-                                    # 保证数值稳定
-                                    w_i = max(0.0, min(1.0, w_i))
+                                    # 稳定化
+                                    w_loc = max(0.0, min(1.0, w_loc))
 
-                                    w_loc *= w_i
                                     num_nonzero += 1
 
                                 # 如果所有轴都被视为“几乎不可判定”（num_nonzero==0），则退回到精确匹配判断
@@ -2314,3 +2305,4 @@ def unregister():
 
 if __name__ == '__main__':
     register()
+
