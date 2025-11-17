@@ -22,6 +22,7 @@ from bpy.props import StringProperty, BoolProperty, FloatProperty, CollectionPro
 
 PREFIX_RESULT = "psd_rot_"  # 旋转结果前缀
 PREFIX_RESULT_LOC = "psd_loc_"  # 位移结果前缀
+PREFIX_RESULT_SCA = "psd_sca_"  # 缩放结果前缀
 
 # 全局计算节流，防止在短时间内重复调用
 last_compute_time = 0.0
@@ -147,6 +148,30 @@ def _capture_bone_local_translation(arm_obj, bone_name, depsgraph=None):
     pose_loc = pb.location.copy()
     return (rest_loc, pose_loc)
 
+def _capture_bone_local_scale(arm_obj, bone_name, depsgraph=None):
+    """
+    捕获骨骼在父空间下的相对缩放 (x,y,z)。Rest 和 Pose 都为 poseBone.scale。
+    """
+    if not arm_obj or arm_obj.type != 'ARMATURE':
+        raise RuntimeError("必须传递一个骨架对象")
+
+    source_obj = arm_obj
+    if depsgraph is not None:
+        try:
+            eval_obj = arm_obj.evaluated_get(depsgraph)
+            if eval_obj:
+                source_obj = eval_obj
+        except Exception:
+            source_obj = arm_obj
+
+    pb = source_obj.pose.bones.get(bone_name)
+    if not pb:
+        raise RuntimeError(f"在对象 '{source_obj.name}' 上找不到姿态骨骼 '{bone_name}'")
+
+    rest_sca = pb.scale.copy()  # 假设 rest 是默认 (1,1,1)，但实际捕捉当前作为 rest
+    pose_sca = pb.scale.copy()
+    return (rest_sca, pose_sca)
+
 def _euler_deg_to_dir(rot_deg, axis='Z'):
     ex, ey, ez = rot_deg
     e = Euler((math.radians(ex), math.radians(ey), math.radians(ez)), 'XYZ')
@@ -259,7 +284,10 @@ class PSDExportConfig(bpy.types.Operator, ExportHelper):
                     "has_loc": bool(e.has_loc),
                     "loc_enabled": bool(e.loc_enabled),
                     "loc_radius": float(e.loc_radius),
-                    "group_name": getattr(e, "group_name", "")
+                    "group_name": getattr(e, "group_name", ""),
+                    "rest_sca": list(e.rest_sca),
+                    "pose_sca": list(e.pose_sca),
+                    "has_sca": bool(e.has_sca)
                 }
                 if e.bone_name in data["bone_pairs"]:
                     data["saved_by_bone"].setdefault(e.bone_name, []).append(item)
@@ -397,6 +425,24 @@ class PSDImportConfig(bpy.types.Operator, ImportHelper):
                 new.loc_radius = float(ent.get("loc_radius", getattr(new, "loc_radius", 0.1)))
             except Exception:
                 pass
+            
+            #scale
+            try:
+                rs = ent.get("rest_sca", [1.0, 1.0, 1.0])
+                if len(rs) >= 3:
+                    new.rest_sca = (float(rs[0]), float(rs[1]), float(rs[2]))
+            except Exception:
+                pass
+            try:
+                ps = ent.get("pose_sca", [1.0, 1.0, 1.0])
+                if len(ps) >= 3:
+                    new.pose_sca = (float(ps[0]), float(ps[1]), float(ps[2]))
+            except Exception:
+                pass
+            try:
+                new.has_sca = bool(ent.get("has_sca", False))
+            except Exception:
+                pass
 
             # group_name 或其他字符串字段
             try:
@@ -409,7 +455,7 @@ class PSDImportConfig(bpy.types.Operator, ImportHelper):
             for k, v in ent.items():
                 if k in {"name","bone_name","rest_rot","pose_rot","has_rot","rot_channel_mode",
                          "cone_enabled","cone_angle","cone_axis","rest_loc","pose_loc",
-                         "has_loc","loc_enabled","loc_radius","group_name"}:
+                         "has_loc","loc_enabled","loc_radius","group_name","rest_sca","pose_sca","has_sca","sca_enabled","sca_radius"}:
                     continue
                 try:
                     if hasattr(new, k):
@@ -479,6 +525,11 @@ class PSDSavedPose(bpy.types.PropertyGroup):
     has_loc: bpy.props.BoolProperty(name="包含位移", default=False)
     loc_enabled: bpy.props.BoolProperty(name="启用位移衰减", default=False)
     loc_radius: bpy.props.FloatProperty(name="位移半径", default=0.1, min=0.0, soft_max=10.0)
+
+    # 缩放通道
+    rest_sca: bpy.props.FloatVectorProperty(name="静止缩放", size=3, default=(1.0,1.0,1.0))
+    pose_sca: bpy.props.FloatVectorProperty(name="姿态缩放", size=3, default=(1.0,1.0,1.0))
+    has_sca: bpy.props.BoolProperty(name="包含缩放", default=False)
 
     is_direct_channel: bpy.props.BoolProperty(name="Direct Channel Record", default=False)
     channel_axis: bpy.props.EnumProperty(
@@ -666,6 +717,7 @@ def _psd_compute_all(depsgraph=None):
             # 预先计算所有相关骨骼的当前旋转和位移（避免重复捕捉）
             bone_to_cur_rot = {}
             bone_to_cur_loc = {}
+            bone_to_cur_sca = {}
             source_obj = arm
             if depsgraph is not None:
                 try:
@@ -686,6 +738,7 @@ def _psd_compute_all(depsgraph=None):
                     pb = source_obj.pose.bones.get(bn)
                     if pb:
                         bone_to_cur_loc[bn] = pb.location.copy()
+                        bone_to_cur_sca[bn] = pb.scale.copy()
                 except Exception:
                     pass
 
@@ -947,7 +1000,54 @@ def _psd_compute_all(depsgraph=None):
                         psd_set_result_datablock_only(arm, key_loc, w_loc, verbose=False)
                     except Exception:
                         pass
-                        
+
+                # 缩放通道计算（如果存在）
+                if getattr(entry, 'has_sca', False):
+                    try:
+                        cur_sca = bone_to_cur_sca.get(bn)
+                        if cur_sca is not None:
+                            # 使用向量投影来计算一个整体的权重 w_sca（类似于位置的非衰减模式）
+                            rest_vec = Vector(getattr(entry, 'rest_sca', (1.0, 1.0, 1.0)))
+                            pose_vec = Vector(getattr(entry, 'pose_sca', (1.0, 1.0, 1.0)))
+                            direction = pose_vec - rest_vec
+                            len2 = direction.length_squared
+
+                            if len2 < 1e-12:
+                                # pose 与 rest 几乎相同，退回到精确匹配判断
+                                w_sca = 1.0 if (cur_sca - rest_vec).length < 1e-6 else 0.0
+                            else:
+                                # t 是 cur 在 rest->pose 线段上的比例（可以小于0或大于1）
+                                t = (cur_sca - rest_vec).dot(direction) / len2
+
+                                if math.isnan(t):
+                                    t = 0.0
+
+                                # 原逻辑映射： <0 ->0 ; >2 ->0 ; 1..2 -> 2 - t ; 0..1 -> t
+                                if t < 0.0 or t > 2.0:
+                                    w_sca = 0.0
+                                elif t > 1.0:
+                                    w_sca = 2.0 - t
+                                else:
+                                    w_sca = t
+
+                                # 稳定化
+                                w_sca = max(0.0, min(1.0, w_sca))
+
+                            if math.isnan(w_sca):
+                                w_sca = 0.0
+                            w_sca = max(0.0, min(1.0, w_sca))
+                        else:
+                            w_sca = 0.0
+                    except Exception:
+                        w_sca = 0.0
+
+                    key_sca = f"{PREFIX_RESULT_SCA}{_safe_name(bn)}_{_safe_name(en)}"
+                    try:
+                        psd_set_result_datablock_only(arm, key_sca, w_sca, verbose=False)
+                    except Exception:
+                        pass
+
+
                 # ---------- 触发器计算 ----------
                 # 参数：arm = 当前 armature object
                 if hasattr(arm, "psd_triggers"):
@@ -1006,6 +1106,8 @@ def _psd_compute_all(depsgraph=None):
                         rep_key = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
                     elif getattr(entry, 'has_loc', False):
                         rep_key = f"{PREFIX_RESULT_LOC}{_safe_name(bn)}_{_safe_name(en)}"
+                    elif getattr(entry, 'has_sca', False):
+                        rep_key = f"{PREFIX_RESULT_SCA}{_safe_name(bn)}_{_safe_name(en)}"
                     else:
                         rep_key = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
                     ent_stats = arm_stats["entries"].setdefault(rep_key, {"hist": [], "last_ms": 0.0, "avg_ms": 0.0})
@@ -1494,6 +1596,52 @@ class PSDCaptureLocation(bpy.types.Operator):
             self.report({'ERROR'}, f"捕捉姿态位置失败: {ex}")
             return {'CANCELLED'}
 
+class PSDCaptureScaleRest(bpy.types.Operator):
+    bl_idname = "psd.capture_sca_rest"
+    bl_label = "捕捉静止缩放"
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架")
+            return {'CANCELLED'}
+        selected_bone = _get_selected_pair_bone(context)
+        if selected_bone == '<NONE>':
+            self.report({'ERROR'}, "骨骼过滤器中未选择骨骼。请先在骨骼过滤器列表中添加/选择一个骨骼。")
+            return {'CANCELLED'}
+        try:
+            rest_sca, _ = _capture_bone_local_scale(arm, selected_bone, depsgraph=None)
+            context.scene.psd_temp_sca_rest_bone = selected_bone
+            context.scene.psd_temp_sca_rest = tuple(rest_sca)
+            self.report({'INFO'}, f"已为 {selected_bone} 捕捉静止缩放: {tuple(rest_sca)}")
+            return {'FINISHED'}
+        except Exception as ex:
+            self.report({'ERROR'}, f"捕捉静止缩放失败: {ex}")
+            return {'CANCELLED'}
+
+class PSDCaptureScale(bpy.types.Operator):
+    bl_idname = "psd.capture_scale"
+    bl_label = "捕捉姿态缩放"
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架")
+            return {'CANCELLED'}
+        selected_bone = _get_selected_pair_bone(context)
+        if selected_bone == '<NONE>':
+            self.report({'ERROR'}, "骨骼过滤器中未选择骨骼。请先在骨骼过滤器列表中添加/选择一个骨骼。")
+            return {'CANCELLED'}
+        try:
+            _, pose_sca = _capture_bone_local_scale(arm, selected_bone, depsgraph=None)
+            context.scene.psd_temp_sca_bone = selected_bone
+            context.scene.psd_temp_sca = tuple(pose_sca)
+            self.report({'INFO'}, f"已为 {selected_bone} 捕捉姿态缩放: {tuple(pose_sca)}")
+            return {'FINISHED'}
+        except Exception as ex:
+            self.report({'ERROR'}, f"捕捉姿态缩放失败: {ex}")
+            return {'CANCELLED'}
+
 # -------------------------------
 # 将捕捉的静止+姿态保存为SavedPose条目 (分离为旋转/位移)
 # -------------------------------
@@ -1550,6 +1698,11 @@ class PSDSaveCapturedRotationEntry(bpy.types.Operator):
         new.has_loc = False
         new.loc_enabled = False
         new.loc_radius = 0.1
+
+        # 确保缩放字段为空/禁用
+        new.rest_sca = (0.0,0.0,0.0)
+        new.pose_sca = (0.0,0.0,0.0)
+        new.has_sca = False
 
         arm.psd_saved_pose_index = len(arm.psd_saved_poses) - 1
 
@@ -1617,6 +1770,10 @@ class PSDSaveCapturedLocationEntry(bpy.types.Operator):
         new.rest_rot = (0.0,0.0,0.0)
         new.pose_rot = (0.0,0.0,0.0)
         new.has_rot = False
+        # 确保缩放字段为空/禁用
+        new.rest_sca = (0.0,0.0,0.0)
+        new.pose_sca = (0.0,0.0,0.0)
+        new.has_sca = False
         # 设置位移字段
         new.rest_loc = rest_vals_loc
         new.pose_loc = pose_vals_loc
@@ -1643,6 +1800,80 @@ class PSDSaveCapturedLocationEntry(bpy.types.Operator):
         self.report({'INFO'}, f"已在骨架 {arm.name} 上为骨骼 {bone_name_loc} 保存位置条目 '{new.name}'")
         return {'FINISHED'}
 
+class PSDSaveCapturedScaleEntry(bpy.types.Operator):
+    bl_idname = "psd.save_captured_scale"
+    bl_label = "保存捕捉的缩放条目"
+
+    entry_name: bpy.props.StringProperty(name="条目名称", default="default")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        arm = context.object
+        scene = context.scene
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架")
+            return {'CANCELLED'}
+
+        bone_sca_r = getattr(scene, 'psd_temp_sca_rest_bone', '')
+        bone_sca_p = getattr(scene, 'psd_temp_sca_bone', '')
+
+        has_sca = bool(bone_sca_p and bone_sca_p != '<NONE>')
+        if not has_sca:
+            self.report({'ERROR'}, "请先捕捉一个缩放 (必需)")
+            return {'CANCELLED'}
+
+        if bone_sca_r and bone_sca_r != bone_sca_p and bone_sca_r != '':
+            self.report({'WARNING'}, "缩放的静止/姿态来自不同骨骼；如有需要，此条目的静止值将设为(1,1,1)")
+            rest_vals_sca = (1.0,1.0,1.0)
+        else:
+            rest_vals_sca = tuple(getattr(scene, 'psd_temp_sca_rest', (1.0,1.0,1.0)))
+
+        pose_vals_sca = tuple(getattr(scene, 'psd_temp_sca', (1.0,1.0,1.0)))
+        bone_name_sca = getattr(scene, 'psd_temp_sca_bone', '')
+
+        # 检查该骨骼是否已存在同名条目
+        for existing in arm.psd_saved_poses:
+            if existing.bone_name == bone_name_sca and existing.name == self.entry_name:
+                self.report({'ERROR'}, f"骨骼 {bone_name_sca} 的条目 '{self.entry_name}' 已存在")
+                return {'CANCELLED'}
+
+        # 创建条目 (仅缩放)
+        new = arm.psd_saved_poses.add()
+        new.name = self.entry_name if self.entry_name else "default"
+        new.bone_name = bone_name_sca
+        new.is_direct_channel = False
+        # 旋转和位置字段为空/禁用
+        new.rest_rot = (0.0,0.0,0.0)
+        new.pose_rot = (0.0,0.0,0.0)
+        new.has_rot = False
+        new.rest_loc = (0.0,0.0,0.0)
+        new.pose_loc = (0.0,0.0,0.0)
+        new.has_loc = False
+        # 设置缩放字段（无衰减）
+        new.rest_sca = rest_vals_sca
+        new.pose_sca = pose_vals_sca
+        new.has_sca = True
+
+        arm.psd_saved_pose_index = len(arm.psd_saved_poses) - 1
+
+        # 清除临时捕捉数据
+        scene.psd_temp_sca_rest = (1.0,1.0,1.0)
+        scene.psd_temp_sca = (1.0,1.0,1.0)
+        scene.psd_temp_sca_rest_bone = ''
+        scene.psd_temp_sca_bone = ''
+
+        # 创建并初始化缩放结果的键
+        entry_key_sca = f"{PREFIX_RESULT_SCA}{_safe_name(new.bone_name)}_{_safe_name(new.name)}"
+        try:
+            arm.data[entry_key_sca] = 0.0
+        except Exception:
+            pass
+
+        self.report({'INFO'}, f"已在骨架 {arm.name} 上为骨骼 {bone_name_sca} 保存缩放条目 '{new.name}'")
+        return {'FINISHED'}
+
 class PSDRemoveSavedEntry(bpy.types.Operator):
     bl_idname = "psd.remove_saved_entry"
     bl_label = "移除已保存的条目"
@@ -1663,6 +1894,7 @@ class PSDRemoveSavedEntry(bpy.types.Operator):
             entry = arm.psd_saved_poses[idx]
             entry_key_rot = f"{PREFIX_RESULT}{_safe_name(entry.bone_name)}_{_safe_name(entry.name)}"
             entry_key_loc = f"{PREFIX_RESULT_LOC}{_safe_name(entry.bone_name)}_{_safe_name(entry.name)}"
+            entry_key_sca = f"{PREFIX_RESULT_SCA}{_safe_name(entry.bone_name)}_{_safe_name(entry.name)}"
             
             # 改进1: 显式获取 Armature Datablock，与写入函数保持一致
             arm_db = bpy.data.armatures.get(arm.data.name)
@@ -1673,6 +1905,8 @@ class PSDRemoveSavedEntry(bpy.types.Operator):
                     del arm_db[entry_key_rot]
                 if entry_key_loc in arm_db:
                     del arm_db[entry_key_loc]
+                if entry_key_sca in arm_db:
+                    del arm_db[entry_key_sca]
             
             # 从UI列表对应的集合中移除该条目
             arm.psd_saved_poses.remove(idx)
@@ -1704,6 +1938,8 @@ class PSDSavedPoseUIList(bpy.types.UIList):
                 tags.append("R")
             if getattr(item, 'has_loc', False):
                 tags.append("L")
+            if getattr(item, 'has_sca', False):
+                tags.append("S")
             if tags:
                 txt += f" [{' '.join(tags)}]"
             layout.label(text=txt)
@@ -1770,13 +2006,11 @@ class PSDPanel(bpy.types.Panel):
         scene = context.scene
         arm = context.object
 
-        layout.label(text=f"骨架: {arm.name}")
-        layout.separator()
-
-        # 骨骼对过滤器 UI (逐骨架)
-        layout.label(text='骨骼过滤器 (若非空，则仅计算这些骨骼):')
-        row = layout.row()
-        row.template_list("PSDBonePairUIList", "psd_bone_pairs", arm, "psd_bone_pairs", arm, "psd_bone_pairs_index", rows=6)
+        # 骨骼过滤器分组
+        box = layout.box()
+        box.label(text="骨骼过滤器 (若非空，仅计算这些骨骼)", icon='BONE_DATA')
+        row = box.row(align=True)
+        row.template_list("PSDBonePairUIList", "psd_bone_pairs", arm, "psd_bone_pairs", arm, "psd_bone_pairs_index", rows=4)
         col = row.column(align=True)
         col.operator('psd.add_bone_pair', icon='ADD', text='')
         col.operator('psd.remove_bone_pair', icon='REMOVE', text='')
@@ -1784,156 +2018,175 @@ class PSDPanel(bpy.types.Panel):
         col.operator('psd.move_bone_pair', icon='TRIA_UP', text='').direction = 'UP'
         col.operator('psd.move_bone_pair', icon='TRIA_DOWN', text='').direction = 'DOWN'
 
-        layout.separator()
-        
-        # 导出 / 导入（JSON）
-        layout.separator()
-        row2 = layout.row(align=True)
-        row2.operator('psd.export_config', icon='EXPORT', text='导出配置')
-        row2.operator('psd.import_config', icon='IMPORT', text='导入配置')
-        
-        layout.separator()
+        # 配置导出/导入
+        box = layout.box()
+        box.label(text="配置管理", icon='FILE')
+        row = box.row(align=True)
+        row.operator('psd.export_config', icon='EXPORT', text='导出')
+        row.operator('psd.import_config', icon='IMPORT', text='导入')
 
-        # 显示骨骼过滤器中当前选择的骨骼
+        # 显示已选骨骼
         selected_bone = _get_selected_pair_bone(context)
-        layout.label(text=f"已选骨骼: {selected_bone}")
-        # 捕捉按钮: 静止/旋转/位移
-        row = layout.row(align=True)
-        row.operator('psd.capture_rest', icon='REW', text='捕捉静止旋转')
-        row.operator('psd.capture_rotation', icon='POSE_HLT', text='捕捉姿态旋转')
-        row = layout.row(align=True)
-        row.operator('psd.capture_loc_rest', icon='EMPTY_AXIS', text='捕捉静止位置')
-        row.operator('psd.capture_location', icon='EMPTY_DATA', text='捕捉姿态位置')
-        
-        layout.separator()
-        layout.label(text="骨骼触发器", icon='EMPTY_DATA')
-        row = layout.row()
-        row.template_list(
-            "PSDBoneTriggerUIList", "psd_triggers",
-            arm, "psd_triggers",
-            arm, "psd_trigger_index",
-            rows=4
-        )
-        col = row.column(align=True)
-        col.operator("psd.add_trigger", icon='ADD', text="")
-        col.operator("psd.remove_trigger", icon='REMOVE', text="")
-        col.separator()
-        col.operator("psd.select_trigger_bone", icon='EYEDROPPER', text="").mode = 'TRIGGER'
-        col.operator("psd.select_trigger_bone", icon='RESTRICT_SELECT_OFF', text="").mode = 'TARGET'
+        layout.label(text=f"已选骨骼: {selected_bone}", icon='INFO')
 
-        # Below the list, show properties of selected trigger
-        idx = arm.psd_trigger_index if arm.psd_trigger_index >= 0 and arm.psd_trigger_index < len(arm.psd_triggers) else -1
-        if idx != -1:
-            trig = arm.psd_triggers[idx]
-            layout.prop(trig, "enabled")
-            layout.prop(trig, "name")
-            # show bone names (readonly) and allow radius edit
-            layout.label(text=f"Trigger Bone: {trig.bone_name}")
-            layout.prop(trig, "target_bone", text="Target Bone")
-            layout.prop(trig, "radius")
-            layout.prop(trig, "falloff")
-            roww = layout.row()
-            roww.label(text=f"实时权重: {trig.last_weight:.3f}")
+        # 捕捉按钮分组
+        box = layout.box()
+        box.label(text="捕捉姿态", icon='CAMERA_DATA')
+        row = box.row(align=True)
+        row.operator('psd.capture_rest', icon='REW', text='静止旋转')
+        row.operator('psd.capture_rotation', icon='POSE_HLT', text='姿态旋转')
+        row = box.row(align=True)
+        row.operator('psd.capture_loc_rest', icon='EMPTY_AXIS', text='静止位置')
+        row.operator('psd.capture_location', icon='EMPTY_DATA', text='姿态位置')
+        row = box.row(align=True)
+        row.operator('psd.capture_sca_rest', icon='EMPTY_AXIS', text='静止缩放')
+        row.operator('psd.capture_scale', icon='EMPTY_DATA', text='姿态缩放')
 
+        # 临时捕捉数据（collapsible）
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(scene, "psd_show_captures", icon='ZOOM_IN' if scene.psd_show_captures else 'ZOOM_OUT', text="捕捉数据")
+        if scene.psd_show_captures:
+            if scene.psd_temp_pose_bone:
+                p = scene.psd_temp_pose
+                box.label(text=f"旋转 (姿态): {scene.psd_temp_pose_bone} (X={p[0]:.2f}°, Y={p[1]:.2f}°, Z={p[2]:.2f}°)")
+            else:
+                box.label(text='无旋转捕捉')
+            if scene.psd_temp_rest_bone:
+                r = scene.psd_temp_rest
+                box.label(text=f"旋转 (静止): {scene.psd_temp_rest_bone} (X={r[0]:.2f}°, Y={r[1]:.2f}°, Z={r[2]:.2f}°)")
+            if scene.psd_temp_loc_bone:
+                l = scene.psd_temp_loc
+                box.label(text=f"位置 (姿态): {scene.psd_temp_loc_bone} (X={l[0]:.4f}, Y={l[1]:.4f}, Z={l[2]:.4f})")
+            else:
+                box.label(text='无位置捕捉')
+            if scene.psd_temp_loc_rest_bone:
+                lr = scene.psd_temp_loc_rest
+                box.label(text=f"位置 (静止): {scene.psd_temp_loc_rest_bone} (X={lr[0]:.4f}, Y={lr[1]:.4f}, Z={lr[2]:.4f})")
+            if scene.psd_temp_sca_bone:
+                s = scene.psd_temp_sca
+                box.label(text=f"缩放 (姿态): {scene.psd_temp_sca_bone} (X={s[0]:.4f}, Y={s[1]:.4f}, Z={s[2]:.4f})")
+            else:
+                box.label(text='无缩放捕捉')
+            if scene.psd_temp_sca_rest_bone:
+                sr = scene.psd_temp_sca_rest
+                box.label(text=f"缩放 (静止): {scene.psd_temp_sca_rest_bone} (X={sr[0]:.4f}, Y={sr[1]:.4f}, Z={sr[2]:.4f})")
 
-        layout.separator()
-        # 显示临时捕捉的数据
-        if scene.psd_temp_pose_bone:
-            p = scene.psd_temp_pose
-            layout.label(text=f"已捕捉旋转: {scene.psd_temp_pose_bone} (X={p[0]:.2f}°, Y={p[1]:.2f}°, Z={p[2]:.2f}°)")
-        else:
-            layout.label(text='无已捕捉的旋转')
-        if scene.psd_temp_rest_bone:
-            r = scene.psd_temp_rest
-            layout.label(text=f"已捕捉静止旋转: {scene.psd_temp_rest_bone} (X={r[0]:.2f}°, Y={r[1]:.2f}°, Z={r[2]:.2f}°)")
-        if scene.psd_temp_loc_bone:
-            l = scene.psd_temp_loc
-            layout.label(text=f"已捕捉位置: {scene.psd_temp_loc_bone} (X={l[0]:.4f}, Y={l[1]:.4f}, Z={l[2]:.4f})")
-        else:
-            layout.label(text='无已捕捉的位置')
-        if scene.psd_temp_loc_rest_bone:
-            lr = scene.psd_temp_loc_rest
-            layout.label(text=f"已捕捉静止位置: {scene.psd_temp_loc_rest_bone} (X={lr[0]:.4f}, Y={lr[1]:.4f}, Z={lr[2]:.4f})")
+        # 骨骼触发器（collapsible）
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(scene, "psd_show_triggers", icon='ZOOM_IN' if scene.psd_show_triggers else 'ZOOM_OUT', text="骨骼触发器")
+        if scene.psd_show_triggers:
+            subrow = box.row()
+            subrow.template_list("PSDBoneTriggerUIList", "psd_triggers", arm, "psd_triggers", arm, "psd_trigger_index", rows=4)
+            col = subrow.column(align=True)
+            col.operator("psd.add_trigger", icon='ADD', text="")
+            col.operator("psd.remove_trigger", icon='REMOVE', text="")
+            col.separator()
+            col.operator("psd.select_trigger_bone", icon='EYEDROPPER', text="").mode = 'TRIGGER'
+            col.operator("psd.select_trigger_bone", icon='RESTRICT_SELECT_OFF', text="").mode = 'TARGET'
 
-        # 分离的保存按钮
-        layout.separator()
-        row = layout.row(align=True)
-        row.operator('psd.save_captured_rotation', icon='FILE_TICK', text='保存旋转条目')
-        row.operator('psd.save_captured_location', icon='FILE_TICK', text='保存位置条目')
-        row = layout.row(align=True)
-        row.operator('psd.record_channel_x', text="Record X Channel")
-        row.operator('psd.record_channel_y', text="Record Y Channel")
-        row.operator('psd.record_channel_z', text="Record Z Channel")
-        layout.separator()
-        bone_name = selected_bone if selected_bone != '<NONE>' else '无'
-        layout.label(text=f'骨骼 {bone_name} 的已保存姿态条目:')
-        row = layout.row()
-        row.template_list('PSDSavedPoseUIList', 'psd_saved_poses', arm, 'psd_saved_poses', arm, 'psd_saved_pose_index')
-        col = row.column(align=True)
-        col.operator('psd.remove_saved_entry', icon='REMOVE', text='')
+            # 选中触发器详情
+            idx = arm.psd_trigger_index if arm.psd_trigger_index >= 0 and arm.psd_trigger_index < len(arm.psd_triggers) else -1
+            if idx != -1:
+                trig = arm.psd_triggers[idx]
+                box.prop(trig, "enabled")
+                box.prop(trig, "name")
+                box.label(text=f"触发骨骼: {trig.bone_name}")
+                box.prop(trig, "target_bone", text="目标骨骼")
+                box.prop(trig, "radius")
+                box.prop(trig, "falloff")
+                roww = box.row()
+                roww.label(text=f"实时权重: {trig.last_weight:.3f}")
 
-        # 显示选中条目的详细信息
-        if arm.psd_saved_poses and arm.psd_saved_pose_index >= 0 and arm.psd_saved_pose_index < len(arm.psd_saved_poses):
-            e = arm.psd_saved_poses[arm.psd_saved_pose_index]
-            if e.bone_name == selected_bone or selected_bone == '<NONE>':
-                layout.prop(e, 'name', text="条目名称")
-                layout.label(text=f"骨骼: {e.bone_name}")
+        # 保存按钮分组
+        box = layout.box()
+        box.label(text="保存条目", icon='FILE_TICK')
+        row = box.row(align=True)
+        row.operator('psd.save_captured_rotation', text='旋转')
+        row.operator('psd.save_captured_location', text='位置')
+        row.operator('psd.save_captured_scale', text='缩放')
+        row = box.row(align=True)
+        row.operator('psd.record_channel_x', text="Record X")
+        row.operator('psd.record_channel_y', text="Record Y")
+        row.operator('psd.record_channel_z', text="Record Z")
 
-                # 旋转详情
-                if getattr(e, 'is_direct_channel', False):
-                    layout.label(text=f"Direct Record Channel: {e.channel_axis}")
-                    layout.prop(e, 'record_rot_channel_mode', text='record旋转通道模式')
-                else:
-                    layout.label(text=f"静止旋转: X={e.rest_rot[0]:.2f}°, Y={e.rest_rot[1]:.2f}°, Z={e.rest_rot[2]:.2f}°")
-                    layout.label(text=f"姿态旋转: X={e.pose_rot[0]:.2f}°, Y={e.pose_rot[1]:.2f}°, Z={e.pose_rot[2]:.2f}°")
-                    layout.prop(e, 'has_rot', text='包含旋转')
-                    layout.prop(e, 'cone_enabled', text='启用锥形衰减')
-                    if e.cone_enabled:
-                        layout.prop(e, 'cone_angle', text='锥角 (度)')
-                        layout.prop(e, 'cone_axis', text='锥体轴向')
+        # 已保存姿态（collapsible）
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(scene, "psd_show_saved_poses", icon='ZOOM_IN' if scene.psd_show_saved_poses else 'ZOOM_OUT', text="已保存姿态")
+        if scene.psd_show_saved_poses:
+            bone_name = selected_bone if selected_bone != '<NONE>' else '无'
+            subbox = box.box()
+            subbox.label(text=f'骨骼 {bone_name} 的姿态条目:', icon='PRESET')
+            subrow = subbox.row()
+            subrow.template_list('PSDSavedPoseUIList', 'psd_saved_poses', arm, 'psd_saved_poses', arm, 'psd_saved_pose_index')
+            col = subrow.column(align=True)
+            col.operator('psd.remove_saved_entry', icon='REMOVE', text='')
 
-                    # 新增：旋转通道模式 UI
-                    layout.prop(e, 'rot_channel_mode', text='旋转通道模式')
+            # 选中条目详情
+            if arm.psd_saved_poses and arm.psd_saved_pose_index >= 0 and arm.psd_saved_pose_index < len(arm.psd_saved_poses):
+                e = arm.psd_saved_poses[arm.psd_saved_pose_index]
+                if e.bone_name == selected_bone or selected_bone == '<NONE>':
+                    subbox.prop(e, 'name', text="名称")
+                    subbox.label(text=f"骨骼: {e.bone_name}")
 
-                    layout.separator()
-                    # 位移详情
-                    layout.label(text=f"静止位置: X={e.rest_loc[0]:.4f}, Y={e.rest_loc[1]:.4f}, Z={e.rest_loc[2]:.4f}")
-                    layout.label(text=f"姿态位置: X={e.pose_loc[0]:.4f}, Y={e.pose_loc[1]:.4f}, Z={e.pose_loc[2]:.4f}")
-                    layout.prop(e, 'has_loc', text='包含位移')
-                    layout.prop(e, 'loc_enabled', text='启用位置轴向衰减')
+                    # 旋转详情
+                    if getattr(e, 'is_direct_channel', False):
+                        subbox.label(text=f"Direct Channel: {e.channel_axis}")
+                        subbox.prop(e, 'record_rot_channel_mode', text='通道模式')
+                    else:
+                        subbox.label(text=f"静止旋转: X={e.rest_rot[0]:.2f}°, Y={e.rest_rot[1]:.2f}°, Z={e.rest_rot[2]:.2f}°")
+                        subbox.label(text=f"姿态旋转: X={e.pose_rot[0]:.2f}°, Y={e.pose_rot[1]:.2f}°, Z={e.pose_rot[2]:.2f}°")
+                        subbox.prop(e, 'has_rot', text='包含旋转')
+                        subbox.prop(e, 'cone_enabled', text='锥形衰减')
+                        if e.cone_enabled:
+                            subbox.prop(e, 'cone_angle', text='锥角 (度)')
+                            subbox.prop(e, 'cone_axis', text='轴向')
+                        subbox.prop(e, 'rot_channel_mode', text='旋转通道模式')
+
+                    subbox.separator()
+                    # 位置详情
+                    subbox.label(text=f"静止位置: X={e.rest_loc[0]:.4f}, Y={e.rest_loc[1]:.4f}, Z={e.rest_loc[2]:.4f}")
+                    subbox.label(text=f"姿态位置: X={e.pose_loc[0]:.4f}, Y={e.pose_loc[1]:.4f}, Z={e.pose_loc[2]:.4f}")
+                    subbox.prop(e, 'has_loc', text='包含位置')
+                    subbox.prop(e, 'loc_enabled', text='轴向衰减')
                     if e.loc_enabled:
-                        layout.prop(e, 'loc_radius', text='轴向半径')
+                        subbox.prop(e, 'loc_radius', text='半径')
 
-        layout.separator()
+                    subbox.separator()
+                    # 缩放详情
+                    subbox.label(text=f"静止缩放: X={e.rest_sca[0]:.4f}, Y={e.rest_sca[1]:.4f}, Z={e.rest_sca[2]:.4f}")
+                    subbox.label(text=f"姿态缩放: X={e.pose_sca[0]:.4f}, Y={e.pose_sca[1]:.4f}, Z={e.pose_sca[2]:.4f}")
+                    subbox.prop(e, 'has_sca', text='包含缩放')
 
-        # 显示存储在armature.data中的所有PSD结果 (旋转/位移):
-        # PSD 结果显示（可收合、带搜索/排序/上限）
-        layout.separator()
-        layout.label(text='骨架数据中的PSD结果 (旋转/位移):')
-        # 显示开关（用户决定是否展开显示）
-        layout.prop(scene, "psd_show_results", text="展开显示所有 PSD 结果")
-
+        # PSD 结果显示（保持原 collapsible，但用 box 包装）
+        box = layout.box()
+        box.label(text='PSD 结果 (旋转/位置/缩放)', icon='GRAPH')
+        box.prop(scene, "psd_show_results", text="展开显示")
         if scene.psd_show_results:
-            box = layout.box()
-            # 搜索栏和控制项
-            row = box.row(align=True)
+            subbox = box.box()
+            row = subbox.row(align=True)
             row.prop(scene, "psd_results_search", text="", icon='VIEWZOOM')
-            row = box.row(align=True)
+            row = subbox.row(align=True)
             row.prop(scene, "psd_results_sort_reverse", text="倒序")
             row.prop(scene, "psd_results_limit", text="上限")
 
+            # 原结果收集/显示代码（不变）
             # 收集所有结果到列表（安全地把 keys() 转为 list）
             results = []
             try:
                 a_stats = _psd_perf_stats.get(arm.name, {}) if isinstance(_psd_perf_stats, dict) else {}
                 entries_stats = a_stats.get("entries", {}) if isinstance(a_stats, dict) else {}
                 for k in list(arm.data.keys()):
-                    if isinstance(k, str) and (k.startswith(PREFIX_RESULT) or k.startswith(PREFIX_RESULT_LOC)):
+                    if isinstance(k, str) and (k.startswith(PREFIX_RESULT) or k.startswith(PREFIX_RESULT_LOC) or k.startswith(PREFIX_RESULT_SCA)):
                         # 计算短名与 display 标识
                         if k.startswith(PREFIX_RESULT):
                             short = k[len(PREFIX_RESULT):]
                         elif k.startswith(PREFIX_RESULT_LOC):
                             short = k[len(PREFIX_RESULT_LOC):] + " (位移)"
+                        elif k.startswith(PREFIX_RESULT_SCA):
+                            short = k[len(PREFIX_RESULT_SCA):] + " (缩放)"
                         else:
                             short = k
                         try:
@@ -1985,20 +2238,16 @@ class PSDPanel(bpy.types.Panel):
         else:
             layout.label(text="(已折叠 — 打开 '展开显示所有 PSD 结果' 查看)")
 
-
-
-        layout.separator()
-        layout.label(text="模式:")
-        layout.prop(scene, "psd_mode", text="")
-
+        # 模式和调试分组
+        box = layout.box()
+        box.label(text="运行模式 & 调试", icon='SETTINGS')
+        box.prop(scene, "psd_mode", text="模式")
         if scene.psd_mode in ('AUTO', 'FORCE_TIMER'):
-            layout.prop(scene, "psd_idle_hz", text="空闲频率(Hz)", slider=True)
-
-        layout.separator()
-        layout.label(text="调试/性能:")
-        layout.prop(scene, "psd_perf_enabled", text="显示性能调试信息")
+            box.prop(scene, "psd_idle_hz", text="空闲 Hz", slider=True)
+        box.prop(scene, "psd_perf_enabled", text="性能调试")
         if scene.psd_perf_enabled:
-            layout.prop(scene, "psd_perf_history_len", text="历史记录长度")
+            box.prop(scene, "psd_perf_history_len", text="历史长度")
+            # 原性能显示代码（不变）
             arm_stats = _psd_perf_stats.get(arm.name)
             if arm_stats:
                 layout.label(text=f"骨架性能: {arm_stats.get('last_arm_ms',0.0):.2f} ms")
@@ -2018,13 +2267,14 @@ class PSDPanel(bpy.types.Panel):
             else:
                 layout.label(text="暂无性能数据。请开启调试模式并运行PSD。")
 
-        row2 = layout.row(align=True)
+        # 启动/停止按钮
+        row = layout.row(align=True)
         if scene.psd_running:
-            row2.operator('object.psd_stop', icon='CANCEL')
+            row.operator('object.psd_stop', icon='CANCEL', text='停止')
         else:
-            row2.operator('object.psd_start', icon='PLAY')
+            row.operator('object.psd_start', icon='PLAY', text='启动')
 
-        layout.label(text='(静止/姿态捕捉数据保存在骨架上；骨架数据接收PSD浮点值)')
+        layout.label(text='(姿态数据保存在骨架上；结果写入骨架数据块)', icon='INFO')
 
 # -------------------------------
 # 注册
@@ -2162,6 +2412,7 @@ classes = [
     PSD_OT_AddTrigger,
     PSD_OT_RemoveTrigger,
     PSD_OT_SelectTriggerBone,
+    PSDCaptureScaleRest, PSDCaptureScale, PSDSaveCapturedScaleEntry,
 ]
 
 def register():
@@ -2185,6 +2436,17 @@ def register():
     bpy.types.Scene.psd_temp_loc = bpy.props.FloatVectorProperty(size=3, default=(0.0,0.0,0.0))
     bpy.types.Scene.psd_temp_loc_rest_bone = bpy.props.StringProperty(default='')
     bpy.types.Scene.psd_temp_loc_bone = bpy.props.StringProperty(default='')
+
+    #
+    bpy.types.Scene.psd_temp_sca_rest = bpy.props.FloatVectorProperty(size=3, default=(1.0,1.0,1.0))
+    bpy.types.Scene.psd_temp_sca = bpy.props.FloatVectorProperty(size=3, default=(1.0,1.0,1.0))
+    bpy.types.Scene.psd_temp_sca_rest_bone = bpy.props.StringProperty(default='')
+    bpy.types.Scene.psd_temp_sca_bone = bpy.props.StringProperty(default='')
+
+    #UI
+    bpy.types.Scene.psd_show_captures = bpy.props.BoolProperty(name="显示捕捉数据", default=True)
+    bpy.types.Scene.psd_show_triggers = bpy.props.BoolProperty(name="显示触发器", default=True)
+    bpy.types.Scene.psd_show_saved_poses = bpy.props.BoolProperty(name="显示已保存姿态", default=True)
 
     bpy.types.Scene.psd_running = bpy.props.BoolProperty(default=False)
 
@@ -2286,7 +2548,8 @@ def unregister():
 
     for p in ('psd_temp_rest','psd_temp_pose','psd_temp_rest_bone','psd_temp_pose_bone',
               'psd_temp_loc_rest','psd_temp_loc','psd_temp_loc_rest_bone','psd_temp_loc_bone',
-              'psd_running','psd_mode','psd_idle_hz','psd_perf_enabled','psd_perf_history_len','psd_show_results','psd_results_search','psd_results_sort_by','psd_results_sort_reverse','psd_results_limit'):
+              'psd_running','psd_mode','psd_idle_hz','psd_perf_enabled','psd_perf_history_len','psd_show_results','psd_results_search','psd_results_sort_by','psd_results_sort_reverse','psd_results_limit',
+              'psd_temp_sca_rest','psd_temp_sca','psd_temp_sca_rest_bone','psd_temp_sca_bone','psd_show_captures','psd_show_triggers','psd_show_saved_poses'):
         try:
             delattr(bpy.types.Scene, p)
         except Exception:
@@ -2305,4 +2568,3 @@ def unregister():
 
 if __name__ == '__main__':
     register()
-
