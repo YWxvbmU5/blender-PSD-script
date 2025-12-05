@@ -1,6 +1,6 @@
 bl_info = {
     "name": "PSD校正器",
-    "author": "海绵表哥和许多LLM大模型辅助",
+    "author": "s0lus",
     "version": (2, 8),
     "blender": (4, 3, 2),
     "location": "3D视图 > 侧边栏 > PSD",
@@ -18,6 +18,7 @@ import json
 import os
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 from bpy.props import StringProperty, BoolProperty, FloatProperty, CollectionProperty, IntProperty, EnumProperty
+from bpy.app.handlers import persistent
 
 
 PREFIX_RESULT = "psd_rot_"  # 旋转结果前缀
@@ -31,6 +32,156 @@ last_compute_time = 0.0
 # 性能存储 (内存中, 插件生命周期内有效)
 # -------------------------------
 _psd_perf_stats = {}
+
+
+#------------------------------------
+# ---------- Deferred writes and per-frame flush (module-level) ----------
+PSD_WRITE_EPS = 1e-4   # 写入阈值：可调为 1e-4 或 1e-3
+
+# pending writes: { arm_key: { key: value, ... }, ... }
+_psd_pending_writes = {}
+
+def _psd_get_arm_key(arm):
+    try:
+        return arm.as_pointer()
+    except Exception:
+        return id(arm)
+
+def psd_set_result_datablock_only(arm, key, value, defer=True, verbose=False):
+    """
+    智能写入接口（兼容旧调用）：
+      - defer=True (默认)：将写入入队（等待 flush），推荐使用。
+      - defer=False：立即写入（但不强制 update_tag()）；保留阈值保护。
+    """
+    global _psd_pending_writes, PSD_WRITE_EPS
+    try:
+        v = float(value)
+    except Exception:
+        # 无法转为 float，尝试直接写到对象自定义属性（退化）
+        try:
+            arm[key] = value
+        except Exception:
+            if verbose:
+                print("psd_set_result_datablock_only: 无法写入值（非数值）", key, value)
+        return
+
+    arm_key = _psd_get_arm_key(arm)
+    if defer:
+        bucket = _psd_pending_writes.setdefault(arm_key, {})
+        bucket[key] = v  # 后来的覆盖早先的
+        return
+
+    # immediate (non-deferred) write -- still use threshold but do not call update_tag here
+    try:
+        arm_db = None
+        if hasattr(arm, "data"):
+            arm_db = bpy.data.armatures.get(arm.data.name)
+        if arm_db is None:
+            prev = arm.get(key, None)
+            if prev is None or abs(float(prev) - v) > PSD_WRITE_EPS:
+                arm[key] = v
+        else:
+            prev = arm_db.get(key, None)
+            if prev is None or abs(float(prev) - v) > PSD_WRITE_EPS:
+                arm_db[key] = v
+    except Exception:
+        if verbose:
+            print("psd_set_result_datablock_only: immediate write failed", key, value)
+
+def _psd_find_arm_by_key(arm_key):
+    """通过 arm_key 在 bpy.data.objects 中查找 armature object（通常对象数量不多，线性查找可接受）。"""
+    for o in bpy.data.objects:
+        if o.type != 'ARMATURE':
+            continue
+        try:
+            if o.as_pointer() == arm_key:
+                return o
+        except Exception:
+            if id(o) == arm_key:
+                return o
+    return None
+
+def _psd_flush_pending_for_arm_obj(arm):
+    """Flush 指定 arm 的 pending writes：比较阈值并对该 arm_db 调用一次 update_tag()（如果有写入）。"""
+    global _psd_pending_writes, PSD_WRITE_EPS
+    if arm is None:
+        return
+    arm_key = _psd_get_arm_key(arm)
+    writes = _psd_pending_writes.pop(arm_key, None)
+    if not writes:
+        return
+
+    try:
+        arm_db = None
+        if hasattr(arm, "data"):
+            arm_db = bpy.data.armatures.get(arm.data.name)
+    except Exception:
+        arm_db = None
+
+    any_written = False
+    if arm_db is None:
+        # fallback 写到 object 自身 custom props
+        for k, v in writes.items():
+            try:
+                prev = arm.get(k, None)
+                if prev is None or abs(float(prev) - float(v)) > PSD_WRITE_EPS:
+                    arm[k] = float(v)
+                    any_written = True
+            except Exception:
+                try:
+                    arm[k] = float(v)
+                    any_written = True
+                except Exception:
+                    pass
+    else:
+        for k, v in writes.items():
+            try:
+                prev = arm_db.get(k, None)
+                if prev is None or abs(float(prev) - float(v)) > PSD_WRITE_EPS:
+                    arm_db[k] = float(v)
+                    any_written = True
+            except Exception:
+                try:
+                    arm_db[k] = float(v)
+                    any_written = True
+                except Exception:
+                    pass
+        if any_written:
+            try:
+                arm_db.update_tag()
+            except Exception:
+                pass
+
+def _psd_flush_all_pending():
+    """Flush 所有 pending writes（逐个查找 arm，存在则 flush）。"""
+    global _psd_pending_writes
+    pending_keys = list(_psd_pending_writes.keys())
+    for arm_key in pending_keys:
+        arm = _psd_find_arm_by_key(arm_key)
+        if arm is not None:
+            _psd_flush_pending_for_arm_obj(arm)
+        else:
+            # arm 被删除或不可用：丢弃 pending bucket
+            _psd_pending_writes.pop(arm_key, None)
+
+# Frame handler: 每帧调用 flush（注册到 frame_change_post）
+
+
+@persistent
+def _psd_frame_flush_handler(scene):
+    # 这是你已有的 flush 调用
+    try:
+        _psd_flush_all_pending()
+    except Exception:
+        pass
+
+def register_psd_frame_flush_handler():
+    if _psd_frame_flush_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_psd_frame_flush_handler)
+
+def unregister_psd_frame_flush_handler():
+    if _psd_frame_flush_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_psd_frame_flush_handler)
 
 
 # ---------- PSD 骨骼状态缓存（用于检测骨骼是否变化） ----------
@@ -718,33 +869,29 @@ class PSD_OT_MoveBonePair(bpy.types.Operator):
 # -------------------------------
 def _psd_compute_all(depsgraph=None):
     """
-    计算所有 armature 的 PSD 结果（修正版，包含稳健的骨骼变换检测缓存）。
-    保持权重计算逻辑不变，改变点仅在缓存/跳过未变化骨骼和触发器访问上。
+    优化版 _psd_compute_all（入队 writes -> 由 frame handler 每帧 flush）。
+    计算结果不再直接写入 arm.data，而是放入模块级 _psd_pending_writes[arm_key]。
     """
-    global last_compute_time, _psd_perf_stats, _psd_bone_state_cache
+    global last_compute_time, _psd_perf_stats, _psd_bone_state_cache, _psd_pending_writes, PSD_WRITE_EPS
     current_time = time.time()
 
-    # 计算最小间隔：播放时不节流 -> min_interval = 0.0；空闲时读取场景属性 psd_idle_hz
+    # 节流（播放时不节流）
     try:
         sc = bpy.context.scene if (bpy.context and getattr(bpy.context, "scene", None)) else None
         if _is_animation_playing():
             min_interval = 0.0
         else:
             hz = int(getattr(sc, "psd_idle_hz", 10) or 10)
-            if hz < 1:
-                hz = 1
-            elif hz > 240:
-                hz = 240
+            hz = max(1, min(240, hz))
             min_interval = 1.0 / float(hz)
     except Exception:
         min_interval = 0.05
 
-    if min_interval > 0.0:
-        if current_time - last_compute_time < min_interval:
-            return
+    if min_interval > 0.0 and (current_time - last_compute_time < min_interval):
+        return
     last_compute_time = current_time
 
-    # perf flag
+    # 性能统计开关
     perf_enabled = False
     try:
         sc = bpy.context.scene if bpy.context and bpy.context.scene else None
@@ -756,32 +903,35 @@ def _psd_compute_all(depsgraph=None):
 
     t_start_total = time.perf_counter() if perf_enabled else None
 
-    # Debug：临时打开以验证缓存行为（不要长期开启）
-    DEBUG_CACHE = False
+    # 本函数局部绑定（减少全局查找）
+    Vector_local = Vector
+    euler_to_quat_local = _euler_deg_to_quat
+    tri_ratio_local = _triangular_ratio
+    safe_name_local = _safe_name
+    clamp01_local = _clamp01 if '_clamp01' in globals() else (lambda x: max(0.0, min(1.0, x)))
+    DEBUG_CACHE = False  # 临时打开以调试缓存行为
 
-    for arm in [o for o in bpy.data.objects if o.type == 'ARMATURE']:
+    for arm in (o for o in bpy.data.objects if o.type == 'ARMATURE'):
         try:
-            # 可靠的缓存 key（优先 as_pointer()，否则 id(arm)）
+            # 可靠的缓存键（优先 as_pointer）
             try:
                 arm_key = arm.as_pointer()
             except Exception:
                 arm_key = id(arm)
 
-            # 如果旧实现/用户之前的缓存是用 arm.name 保存的，迁移它到 arm_key（一次性）
+            # 兼容迁移：若旧缓存以 arm.name 保存则迁移一次
             if arm_key not in _psd_bone_state_cache and getattr(arm, "name", None) in _psd_bone_state_cache:
                 try:
                     _psd_bone_state_cache[arm_key] = _psd_bone_state_cache.pop(arm.name)
                 except Exception:
                     _psd_bone_state_cache.setdefault(arm_key, {})
 
-            try:
-                saved = getattr(arm, 'psd_saved_poses', None)
-                if not saved:
-                    continue
-            except Exception:
+            # 获取 saved entries（自定义属性在原始 arm 上）
+            saved = getattr(arm, 'psd_saved_poses', None)
+            if not saved:
                 continue
 
-            # bone_filter（和你原来逻辑一致）
+            # bone_filter
             bone_filter = None
             try:
                 if getattr(arm, "psd_bone_pairs", None) and len(arm.psd_bone_pairs) > 0:
@@ -791,7 +941,7 @@ def _psd_compute_all(depsgraph=None):
             if bone_filter is None:
                 bone_filter = set(e.bone_name for e in saved if e.bone_name)
 
-            # 预采样：当前旋转/位移/缩放（避免重复捕捉）
+            # 预采样 transforms（一次 per bone）
             bone_to_cur_rot = {}
             bone_to_cur_loc = {}
             bone_to_cur_sca = {}
@@ -805,24 +955,21 @@ def _psd_compute_all(depsgraph=None):
                 source_obj = arm
 
             for bn in bone_filter:
-                # 旋转（使用你原有的采样函数）
                 try:
                     cur_deg = _capture_bone_local_rotation_deg(arm, bn, depsgraph=depsgraph)
                     if cur_deg is not None:
-                        bone_to_cur_rot[bn] = Vector(cur_deg)
+                        bone_to_cur_rot[bn] = Vector_local(cur_deg)
                 except Exception:
                     pass
-                # 位移 / 缩放（从评估对象的 pose.bones 取，或原始 arm 的 pose.bones）
                 try:
                     pb = source_obj.pose.bones.get(bn)
                     if pb:
-                        # copy() 保证接下来的比较不会被外部修改影响
                         bone_to_cur_loc[bn] = pb.location.copy()
                         bone_to_cur_sca[bn] = pb.scale.copy()
                 except Exception:
                     pass
 
-            # ----------------- 增加：检测哪些骨骼在本帧没有变化，后面跳过这些骨骼 -----------------
+            # 构造 skip_bones 缓存（基于 arm_key）
             arm_cache = _psd_bone_state_cache.setdefault(arm_key, {})
             skip_bones = set()
             _PSD_EPS = 1e-5
@@ -832,305 +979,324 @@ def _psd_compute_all(depsgraph=None):
                 if sample is not None and last_sample is not None and _psd_samples_equal(sample, last_sample, eps=_PSD_EPS):
                     skip_bones.add(bn_check)
                 else:
-                    # 仅在可采样时写入缓存，避免写入 None
                     if sample is not None:
                         arm_cache[bn_check] = sample
 
-            if DEBUG_CACHE:
-                print(f"[PSD CACHE] arm.name={arm.name} arm_key={arm_key} skip {len(skip_bones)} bones; cached={len(arm_cache)}")
-
-            # ------------------------------------------------------------------------------------
-
-            # ----------------- 修复：排除触发器引用的骨骼，不对它们做跳过优化 -----------------
+            # 排除触发器相关骨骼（触发器不走缓存优化）
             try:
                 trigger_bones = set()
-                # 一定要用原始 arm（不要用 eval_obj）去访问自定义 collection
                 for trig in getattr(arm, "psd_triggers", ()):
-                    # trig.bone_name 是触发器位置来源，trig.target_bone 是被写回结果的目标骨骼
                     if getattr(trig, "bone_name", None):
                         trigger_bones.add(trig.bone_name)
                     if getattr(trig, "target_bone", None):
                         trigger_bones.add(trig.target_bone)
-                # 从 skip_bones 中去掉触发器相关骨骼（如果它们存在）
                 if trigger_bones:
                     skip_bones.difference_update(trigger_bones)
             except Exception:
-                # 忽略任何访问异常，保证稳健性
                 pass
-            # -----------------------------------------------------------------------------
 
+            if DEBUG_CACHE:
+                print(f"[PSD CACHE] arm={arm.name} cached={len(arm_cache)} skip={len(skip_bones)}")
 
-            # perf container
+            # performance container
             arm_stats = None
             if perf_enabled:
                 arm_stats = _psd_perf_stats.setdefault(arm.name, {"last_total_ms": 0.0, "last_arm_ms": 0.0, "entries": {}})
 
             t_start_arm = time.perf_counter() if perf_enabled else None
 
-            # 遍历 saved entries（按条目计算），但跳过 skip_bones
-            for entry in saved:
-                bn = entry.bone_name
-                en = entry.name
-                if not bn or not en:
+            # 分组 entries（按骨骼），避免重复创建相同的 Vector(entry.*)
+            bone_entries = {}
+            for e in saved:
+                bn = e.bone_name
+                if not bn:
                     continue
+                bone_entries.setdefault(bn, []).append(e)
+
+            # 收集所有待写入的键值（先放在本地 writes）
+            writes = {}
+
+            # per-bone loop
+            for bn, entries in bone_entries.items():
                 if bn not in bone_filter:
                     continue
-                # 如果未采样到该骨骼的任何通道则跳过
+                # 未采样则跳过
                 if bn not in bone_to_cur_rot and bn not in bone_to_cur_loc:
                     continue
-                # 跳过本帧被判定为未变化的骨骼
                 if bn in skip_bones:
                     continue
 
-                t_entry_start = time.perf_counter() if perf_enabled else None
+                # 缓存一次 cur_rot/loc/sca 的局部引用
+                cur_rot = bone_to_cur_rot.get(bn)
+                cur_loc = bone_to_cur_loc.get(bn)
+                cur_sca = bone_to_cur_sca.get(bn)
 
-                # ---------------- Direct channel ----------------
-                if getattr(entry, 'is_direct_channel', False):
-                    try:
-                        key_rot = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
-                        cur_rot = bone_to_cur_rot.get(bn)
-                        if cur_rot is None:
-                            psd_set_result_datablock_only(arm, key_rot, 0.0, verbose=False)
-                        else:
-                            mode = getattr(entry, 'record_rot_channel_mode', 'NONE')
-                            axis_idx_map = {'X': 0, 'Y': 1, 'Z': 2}
-                            ch_axis = getattr(entry, 'channel_axis', 'X')
-                            axis_idx = axis_idx_map.get(ch_axis, 0)
-                            cur_rot_value = cur_rot[axis_idx]
-                            q_cur = _euler_deg_to_quat(tuple(cur_rot))
+                # 预绑定一些常用局部变量，减少重复创建
+                for entry in entries:
+                    en = entry.name
+                    if not en:
+                        continue
 
-                            if mode == 'record_rot_SWING_Y_TWIST':
-                                twist_axis = Vector((0.0, 1.0, 0.0))
-                                swing_t, twist_t = _swing_twist_decompose(q_cur, twist_axis)
-                                W_cur = math.degrees(2.0 * math.acos(_clamp01(swing_t.w)))
-                                cur_twist_angle = _signed_angle_from_quat(twist_t, twist_axis)
-                                if ch_axis == 'Y':
-                                    w = _triangular_ratio(cur_twist_angle, W_cur)
-                                else:
-                                    w = _triangular_ratio(W_cur, W_cur)
-                            else:
-                                w = cur_rot_value
-
-                            w = math.radians(w)
-                            if math.isnan(w):
-                                w = 0.0
-                            psd_set_result_datablock_only(arm, key_rot, w, verbose=False)
-                    except Exception as e:
+                    # cheap-path: 若 pose==rest 且 cur 值接近 rest，则快速计算并跳过重运算
+                    if getattr(entry, 'has_rot', False):
                         try:
-                            key_rot = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
-                            psd_set_result_datablock_only(arm, key_rot, 0.0, verbose=False)
+                            if tuple(entry.pose_rot) == tuple(entry.rest_rot) and cur_rot is not None:
+                                w_quick = 1.0 if (cur_rot - Vector_local(entry.rest_rot)).length < 1e-6 else 0.0
+                                key_rot = f"{PREFIX_RESULT}{safe_name_local(bn)}_{safe_name_local(en)}"
+                                writes[key_rot] = float(max(0.0, min(1.0, w_quick)))
+                            else:
+                                pass
                         except Exception:
                             pass
 
-                # ---------------- Rotation channel ----------------
-                if getattr(entry, 'has_rot', False):
-                    try:
-                        cur_rot = bone_to_cur_rot.get(bn)
-                        if cur_rot is not None:
-                            if getattr(entry, 'cone_enabled', False):
-                                dir_center = _euler_deg_to_dir(entry.pose_rot, entry.cone_axis)
-                                dir_cur = _euler_deg_to_dir(tuple(cur_rot), entry.cone_axis)
-                                dot = max(-1.0, min(1.0, dir_center.dot(dir_cur)))
-                                angle_rad = math.acos(dot)
-                                angle_deg = math.degrees(angle_rad)
-                                if angle_deg <= entry.cone_angle:
-                                    w = 1.0 - (angle_deg / entry.cone_angle) if entry.cone_angle > 0.0 else 1.0
+                    # Direct channel: 记录单轴或 swing_twist（cheap-path 也可适用）
+                    if getattr(entry, 'is_direct_channel', False):
+                        try:
+                            key_rot = f"{PREFIX_RESULT}{safe_name_local(bn)}_{safe_name_local(en)}"
+                            if cur_rot is None:
+                                writes[key_rot] = 0.0
+                            else:
+                                ch_axis = getattr(entry, 'channel_axis', 'X')
+                                axis_idx = 0 if ch_axis == 'X' else (1 if ch_axis == 'Y' else 2)
+                                cur_rot_value = cur_rot[axis_idx]
+                                mode = getattr(entry, 'record_rot_channel_mode', 'NONE')
+                                if mode == 'record_rot_SWING_Y_TWIST':
+                                    q_cur = euler_to_quat_local(tuple(cur_rot))
+                                    twist_axis = Vector_local((0.0, 1.0, 0.0))
+                                    swing_t, twist_t = _swing_twist_decompose(q_cur, twist_axis)
+                                    W_cur = math.degrees(2.0 * math.acos(clamp01_local(swing_t.w)))
+                                    cur_twist_angle = _signed_angle_from_quat(twist_t, twist_axis)
+                                    if ch_axis == 'Y':
+                                        w = tri_ratio_local(cur_twist_angle, W_cur)
+                                    else:
+                                        w = tri_ratio_local(W_cur, W_cur)
+                                else:
+                                    w = cur_rot_value
+                                w = math.radians(w)
+                                if math.isnan(w):
+                                    w = 0.0
+                                writes[key_rot] = float(w)
+                        except Exception:
+                            writes[key_rot] = 0.0
+
+                    # rotation detailed channel (only if not filled by cheap-path above)
+                    if getattr(entry, 'has_rot', False):
+                        try:
+                            key_rot = f"{PREFIX_RESULT}{safe_name_local(bn)}_{safe_name_local(en)}"
+                            if key_rot in writes:
+                                pass
+                            else:
+                                if cur_rot is not None:
+                                    if getattr(entry, 'cone_enabled', False):
+                                        dir_center = _euler_deg_to_dir(entry.pose_rot, entry.cone_axis)
+                                        dir_cur = _euler_deg_to_dir(tuple(cur_rot), entry.cone_axis)
+                                        dot = max(-1.0, min(1.0, dir_center.dot(dir_cur)))
+                                        angle_deg = math.degrees(math.acos(dot))
+                                        if angle_deg <= entry.cone_angle:
+                                            w = 1.0 - (angle_deg / entry.cone_angle) if entry.cone_angle > 0.0 else 1.0
+                                        else:
+                                            w = 0.0
+                                    elif getattr(entry, 'rot_channel_mode', 'NONE') and entry.rot_channel_mode != 'NONE':
+                                        try:
+                                            axis_idx_map = {'SWING_X_TWIST': 0, 'SWING_Y_TWIST': 1, 'SWING_Z_TWIST': 2}
+                                            axis_idx = axis_idx_map.get(entry.rot_channel_mode, 2)
+                                            target_twist_angle = float(entry.pose_rot[axis_idx] - entry.rest_rot[axis_idx])
+                                            cur_twist_angle = float(cur_rot[axis_idx] - entry.rest_rot[axis_idx])
+                                            w_twist = tri_ratio_local(cur_twist_angle, target_twist_angle)
+                                            w = float(max(0.0, min(1.0, w_twist)))
+                                        except Exception:
+                                            pose_dir = Vector_local(entry.pose_rot) - Vector_local(entry.rest_rot)
+                                            cur_rel = Vector_local(cur_rot) - Vector_local(entry.rest_rot)
+                                            denom = pose_dir.dot(pose_dir)
+                                            if denom < 1e-6:
+                                                w = 1.0 if cur_rel.length < 1e-3 else 0.0
+                                            else:
+                                                w = cur_rel.dot(pose_dir) / denom
+                                                if w < 0.0:
+                                                    w = 0.0
+                                                elif w > 2.0:
+                                                    w = 0.0
+                                                elif w > 1.0:
+                                                    w = 2.0 - w
+                                    else:
+                                        pose_dir = Vector_local(entry.pose_rot) - Vector_local(entry.rest_rot)
+                                        cur_rel = cur_rot - Vector_local(entry.rest_rot)
+                                        denom = pose_dir.dot(pose_dir)
+                                        if denom < 1e-6:
+                                            w = 1.0 if cur_rel.length < 1e-3 else 0.0
+                                        else:
+                                            w = cur_rel.dot(pose_dir) / denom
+                                            if w < 0.0:
+                                                w = 0.0
+                                            elif w > 2.0:
+                                                w = 0.0
+                                            elif w > 1.0:
+                                                w = 2.0 - w
                                 else:
                                     w = 0.0
-                            elif getattr(entry, 'rot_channel_mode', 'NONE') and entry.rot_channel_mode != 'NONE':
-                                try:
-                                    # 保持原算法：用轴分量差做三角包络
-                                    axis_idx_map = {'SWING_X_TWIST': 0, 'SWING_Y_TWIST': 1, 'SWING_Z_TWIST': 2}
-                                    axis_idx = axis_idx_map.get(entry.rot_channel_mode, 2)
-                                    target_twist_angle = float(entry.pose_rot[axis_idx] - entry.rest_rot[axis_idx])
-                                    cur_twist_angle = float(cur_rot[axis_idx] - entry.rest_rot[axis_idx])
-                                    w_twist = _triangular_ratio(cur_twist_angle, target_twist_angle)
-                                    w = float(max(0.0, min(1.0, w_twist)))
-                                except Exception:
-                                    pose_dir = Vector(entry.pose_rot) - Vector(entry.rest_rot)
-                                    cur_rel = Vector(cur_rot) - Vector(entry.rest_rot)
-                                    denom = pose_dir.dot(pose_dir)
-                                    if denom < 1e-6:
-                                        w = 1.0 if cur_rel.length < 1e-3 else 0.0
+                                if math.isnan(w):
+                                    w = 0.0
+                                writes[key_rot] = float(max(0.0, min(1.0, w)))
+                        except Exception:
+                            writes[key_rot] = 0.0
+
+                    # location channel
+                    if getattr(entry, 'has_loc', False):
+                        try:
+                            key_loc = f"{PREFIX_RESULT_LOC}{safe_name_local(bn)}_{safe_name_local(en)}"
+                            if cur_loc is not None:
+                                center = Vector_local(entry.pose_loc)
+                                radius = float(getattr(entry, 'loc_radius', 0.0) or 0.0)
+                                if getattr(entry, 'loc_enabled', False):
+                                    if radius <= 0.0:
+                                        w_loc = 1.0 if (cur_loc - center).length < 1e-6 else 0.0
                                     else:
-                                        w = cur_rel.dot(pose_dir) / denom
-                                        if w < 0.0:
-                                            w = 0.0
-                                        elif w > 2.0:
-                                            w = 0.0
-                                        elif w > 1.0:
-                                            w = 2.0 - w
-                            else:
-                                pose_dir = Vector(entry.pose_rot) - Vector(entry.rest_rot)
-                                cur_rel = cur_rot - Vector(entry.rest_rot)
-                                denom = pose_dir.dot(pose_dir)
-                                if denom < 1e-6:
-                                    w = 1.0 if cur_rel.length < 1e-3 else 0.0
+                                        d = cur_loc - center
+                                        wx = max(0.0, 1.0 - abs(d.x) / radius)
+                                        wy = max(0.0, 1.0 - abs(d.y) / radius)
+                                        wz = max(0.0, 1.0 - abs(d.z) / radius)
+                                        w_loc = wx * wy * wz
                                 else:
-                                    w = cur_rel.dot(pose_dir) / denom
-                                    if w < 0.0:
-                                        w = 0.0
-                                    elif w > 2.0:
-                                        w = 0.0
-                                    elif w > 1.0:
-                                        w = 2.0 - w
-                            if math.isnan(w):
-                                w = 0.0
-                            w = max(0.0, min(1.0, w))
-                        else:
-                            w = 0.0
-                    except Exception:
-                        w = 0.0
-
-                    key_rot = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
-                    try:
-                        psd_set_result_datablock_only(arm, key_rot, w, verbose=False)
-                    except Exception:
-                        pass
-
-                # ---------------- Location channel ----------------
-                if getattr(entry, 'has_loc', False):
-                    try:
-                        cur_loc = bone_to_cur_loc.get(bn)
-                        if cur_loc is not None:
-                            center = Vector(entry.pose_loc)
-                            radius = float(getattr(entry, 'loc_radius', 0.0) or 0.0)
-                            if getattr(entry, 'loc_enabled', False):
-                                if radius <= 0.0:
-                                    w_loc = 1.0 if (cur_loc - center).length < 1e-6 else 0.0
-                                else:
-                                    d = cur_loc - center
-                                    wx = max(0.0, 1.0 - abs(d.x) / radius)
-                                    wy = max(0.0, 1.0 - abs(d.y) / radius)
-                                    wz = max(0.0, 1.0 - abs(d.z) / radius)
-                                    w_loc = wx * wy * wz
+                                    rest_vec = Vector_local(getattr(entry, 'rest_loc', (0.0, 0.0, 0.0)))
+                                    pose_vec = Vector_local(getattr(entry, 'pose_loc', (0.0, 0.0, 0.0)))
+                                    direction = pose_vec - rest_vec
+                                    len2 = direction.length_squared
+                                    if len2 < 1e-12:
+                                        w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
+                                    else:
+                                        t = (cur_loc - rest_vec).dot(direction) / len2
+                                        if math.isnan(t):
+                                            t = 0.0
+                                        if t < 0.0 or t > 2.0:
+                                            w_loc = 0.0
+                                        elif t > 1.0:
+                                            w_loc = 2.0 - t
+                                        else:
+                                            w_loc = t
+                                        w_loc = max(0.0, min(1.0, w_loc))
+                                if math.isnan(w_loc):
+                                    w_loc = 0.0
                             else:
-                                w_loc = 1.0
-                                num_nonzero = 0
-                                rest_vec = Vector(getattr(entry, 'rest_loc', (0.0, 0.0, 0.0)))
-                                pose_vec = Vector(getattr(entry, 'pose_loc', (0.0, 0.0, 0.0)))
+                                w_loc = 0.0
+                            writes[key_loc] = float(w_loc)
+                        except Exception:
+                            writes[key_loc] = 0.0
+
+                    # scale channel
+                    if getattr(entry, 'has_sca', False):
+                        try:
+                            key_sca = f"{PREFIX_RESULT_SCA}{safe_name_local(bn)}_{safe_name_local(en)}"
+                            if cur_sca is not None:
+                                rest_vec = Vector_local(getattr(entry, 'rest_sca', (1.0, 1.0, 1.0)))
+                                pose_vec = Vector_local(getattr(entry, 'pose_sca', (1.0, 1.0, 1.0)))
                                 direction = pose_vec - rest_vec
                                 len2 = direction.length_squared
                                 if len2 < 1e-12:
-                                    w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
+                                    w_sca = 1.0 if (cur_sca - rest_vec).length < 1e-6 else 0.0
                                 else:
-                                    t = (cur_loc - rest_vec).dot(direction) / len2
+                                    t = (cur_sca - rest_vec).dot(direction) / len2
                                     if math.isnan(t):
                                         t = 0.0
                                     if t < 0.0 or t > 2.0:
-                                        w_loc = 0.0
+                                        w_sca = 0.0
                                     elif t > 1.0:
-                                        w_loc = 2.0 - t
+                                        w_sca = 2.0 - t
                                     else:
-                                        w_loc = t
-                                    w_loc = max(0.0, min(1.0, w_loc))
-                                    num_nonzero += 1
-                                if num_nonzero == 0:
-                                    w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
-                            if math.isnan(w_loc):
-                                w_loc = 0.0
-                            w_loc = max(0.0, min(1.0, w_loc))
-                        else:
-                            w_loc = 0.0
-                    except Exception:
-                        w_loc = 0.0
-
-                    key_loc = f"{PREFIX_RESULT_LOC}{_safe_name(bn)}_{_safe_name(en)}"
-                    try:
-                        psd_set_result_datablock_only(arm, key_loc, w_loc, verbose=False)
-                    except Exception:
-                        pass
-
-                # ---------------- Scale channel ----------------
-                if getattr(entry, 'has_sca', False):
-                    try:
-                        cur_sca = bone_to_cur_sca.get(bn)
-                        if cur_sca is not None:
-                            rest_vec = Vector(getattr(entry, 'rest_sca', (1.0, 1.0, 1.0)))
-                            pose_vec = Vector(getattr(entry, 'pose_sca', (1.0, 1.0, 1.0)))
-                            direction = pose_vec - rest_vec
-                            len2 = direction.length_squared
-                            if len2 < 1e-12:
-                                w_sca = 1.0 if (cur_sca - rest_vec).length < 1e-6 else 0.0
+                                        w_sca = t
+                                    w_sca = max(0.0, min(1.0, w_sca))
                             else:
-                                t = (cur_sca - rest_vec).dot(direction) / len2
-                                if math.isnan(t):
-                                    t = 0.0
-                                if t < 0.0 or t > 2.0:
-                                    w_sca = 0.0
-                                elif t > 1.0:
-                                    w_sca = 2.0 - t
-                                else:
-                                    w_sca = t
-                                w_sca = max(0.0, min(1.0, w_sca))
-                            if math.isnan(w_sca):
                                 w_sca = 0.0
-                            w_sca = max(0.0, min(1.0, w_sca))
-                        else:
-                            w_sca = 0.0
-                    except Exception:
-                        w_sca = 0.0
+                            writes[key_sca] = float(w_sca)
+                        except Exception:
+                            writes[key_sca] = 0.0
 
-                    key_sca = f"{PREFIX_RESULT_SCA}{_safe_name(bn)}_{_safe_name(en)}"
+                    # 记录每条目的 perf（在条目内，只统计计算时间）
+                    if perf_enabled:
+                        t_entry_end = time.perf_counter()
+                        dt_ms = max(0.0, (t_entry_end - (t_entry_start if 't_entry_start' in locals() else t_entry_end)) * 1000.0)
+                        rep_key = f"{PREFIX_RESULT}{safe_name_local(bn)}_{safe_name_local(en)}"
+                        ent_stats = arm_stats["entries"].setdefault(rep_key, {"hist": [], "last_ms": 0.0, "avg_ms": 0.0})
+                        ent_stats["last_ms"] = dt_ms
+                        hist = ent_stats["hist"]
+                        hist.append(dt_ms)
+                        if len(hist) > history_len:
+                            hist.pop(0)
+                        ent_stats["avg_ms"] = (sum(hist) / len(hist)) if hist else 0.0
+
+            # ---------- 触发器：单独每帧计算（忽略 skip_bones） ----------
+            orig_arm = arm
+            if getattr(orig_arm, "psd_triggers", None):
+                for trig in orig_arm.psd_triggers:
+                    trig.last_weight = 0.0
+                    if not trig.enabled:
+                        continue
+                    pb_trigger = orig_arm.pose.bones.get(trig.bone_name)
+                    pb_target = orig_arm.pose.bones.get(trig.target_bone)
+                    if not pb_trigger or not pb_target:
+                        continue
                     try:
-                        psd_set_result_datablock_only(arm, key_sca, w_sca, verbose=False)
+                        head_trigger_world = orig_arm.matrix_world @ pb_trigger.head
+                        head_target_world = orig_arm.matrix_world @ pb_target.head
                     except Exception:
-                        pass
-
-                # ---------- 触发器计算（总是用原始 arm） ----------
-                orig_arm = arm
-                if getattr(orig_arm, "psd_triggers", None):
-                    for trig in orig_arm.psd_triggers:
-                        trig.last_weight = 0.0
-                        if not trig.enabled:
-                            continue
-                        pb_trigger = orig_arm.pose.bones.get(trig.bone_name)
-                        pb_target = orig_arm.pose.bones.get(trig.target_bone)
-                        if not pb_trigger or not pb_target:
-                            continue
-                        try:
-                            head_trigger_world = orig_arm.matrix_world @ pb_trigger.head
-                            head_target_world = orig_arm.matrix_world @ pb_target.head
-                        except Exception:
-                            head_trigger_world = orig_arm.matrix_world @ pb_trigger.bone.head_local
-                            head_target_world = orig_arm.matrix_world @ pb_target.bone.head_local
-
-                        d = (head_target_world - head_trigger_world).length
-                        r = max(1e-6, float(trig.radius))
-                        if trig.falloff == 'SMOOTH':
-                            t = min(max(d / r, 0.0), 1.0)
-                            w = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
-                        else:
-                            w = max(0.0, min(1.0, 1.0 - d / r))
-                        trig.last_weight = w
-                        key_base = f"{PREFIX_RESULT_LOC}{_safe_name(trig.target_bone)}_{_safe_name(trig.name)}"
-                        try:
-                            psd_set_result_datablock_only(orig_arm, f"{key_base}_w", float(w), verbose=False)
-                        except Exception:
-                            pass
-
-                # 性能记录
-                if perf_enabled:
-                    t_entry_end = time.perf_counter()
-                    dt_ms = max(0.0, (t_entry_end - t_entry_start) * 1000.0) if t_entry_start else 0.0
-                    rep_key = None
-                    if getattr(entry, 'has_rot', False):
-                        rep_key = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
-                    elif getattr(entry, 'has_loc', False):
-                        rep_key = f"{PREFIX_RESULT_LOC}{_safe_name(bn)}_{_safe_name(en)}"
-                    elif getattr(entry, 'has_sca', False):
-                        rep_key = f"{PREFIX_RESULT_SCA}{_safe_name(bn)}_{_safe_name(en)}"
+                        head_trigger_world = orig_arm.matrix_world @ pb_trigger.bone.head_local
+                        head_target_world = orig_arm.matrix_world @ pb_target.bone.head_local
+                    d = (head_target_world - head_trigger_world).length
+                    r = max(1e-6, float(trig.radius))
+                    if trig.falloff == 'SMOOTH':
+                        t = min(max(d / r, 0.0), 1.0)
+                        w = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
                     else:
-                        rep_key = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
-                    ent_stats = arm_stats["entries"].setdefault(rep_key, {"hist": [], "last_ms": 0.0, "avg_ms": 0.0})
-                    ent_stats["last_ms"] = dt_ms
-                    hist = ent_stats["hist"]
-                    hist.append(dt_ms)
-                    if len(hist) > history_len:
-                        hist.pop(0)
-                    ent_stats["avg_ms"] = (sum(hist) / len(hist)) if hist else 0.0
+                        w = max(0.0, min(1.0, 1.0 - d / r))
+                    trig.last_weight = w
+                    key_base = f"{PREFIX_RESULT_LOC}{safe_name_local(trig.target_bone)}_{safe_name_local(trig.name)}"
+                    writes[f"{key_base}_w"] = float(w)
 
-            # arm perf
+            # ---------- 改为：把 writes 入队到 _psd_pending_writes（由 frame handler 每帧 flush） ----------
+            if writes:
+                try:
+                    bucket = _psd_pending_writes.setdefault(arm_key, {})
+                    # 后来的覆盖早先的（最后一次写为准）
+                    for k, v in writes.items():
+                        bucket[k] = v
+                except Exception:
+                    # 保险回退：如果入队失败则尝试立即写入（仍使用阈值）
+                    try:
+                        arm_db = bpy.data.armatures.get(arm.data.name)
+                    except Exception:
+                        arm_db = None
+                    if arm_db is None:
+                        for k, v in writes.items():
+                            try:
+                                prev = arm.get(k, None)
+                                if prev is None or abs(float(prev) - float(v)) > PSD_WRITE_EPS:
+                                    arm[k] = float(v)
+                            except Exception:
+                                try:
+                                    arm[k] = float(v)
+                                except Exception:
+                                    pass
+                    else:
+                        any_written = False
+                        for k, v in writes.items():
+                            try:
+                                prev = arm_db.get(k, None)
+                                if prev is None or abs(float(prev) - float(v)) > PSD_WRITE_EPS:
+                                    arm_db[k] = float(v)
+                                    any_written = True
+                            except Exception:
+                                try:
+                                    arm_db[k] = float(v)
+                                    any_written = True
+                                except Exception:
+                                    pass
+                        if any_written:
+                            try:
+                                arm_db.update_tag()
+                            except Exception:
+                                pass
+            # --------------------------------------------------------------------------------------------
+
+            # arm perf record
             if perf_enabled:
                 t_end_arm = time.perf_counter()
                 arm_ms = max(0.0, (t_end_arm - t_start_arm) * 1000.0) if t_start_arm else 0.0
@@ -1139,7 +1305,7 @@ def _psd_compute_all(depsgraph=None):
         except Exception as e:
             print('PSD计算骨架时出错', getattr(arm, "name", "<unknown>"), e)
 
-    # total perf
+    # total perf record
     if perf_enabled:
         t_end_total = time.perf_counter()
         total_ms = max(0.0, (t_end_total - t_start_total) * 1000.0) if t_start_total else 0.0
@@ -1344,7 +1510,7 @@ class PSDStartOperator(bpy.types.Operator):
             except Exception:
                 pass
             try:
-                _remove_handlers_with_name(handlers.frame_change_post, psd_frame_handler.__name__)
+                _remove_handlers_with_name(handlers.frame_change_post, _psd_frame_flush_handler.__name__)
             except Exception:
                 pass
 
@@ -1354,8 +1520,8 @@ class PSDStartOperator(bpy.types.Operator):
             except Exception:
                 pass
             try:
-                if not any(_handler_name_matches(h, psd_frame_handler.__name__) for h in handlers.frame_change_post):
-                    handlers.frame_change_post.append(psd_frame_handler)
+                if not any(_handler_name_matches(h, _psd_frame_flush_handler.__name__) for h in handlers.frame_change_post):
+                    handlers.frame_change_post.append(_psd_frame_flush_handler)
             except Exception:
                 pass
 
@@ -1400,12 +1566,13 @@ class PSDStopOperator(bpy.types.Operator):
         except Exception:
             pass
         try:
-            if psd_frame_handler in handlers.frame_change_post:
-                handlers.frame_change_post.remove(psd_frame_handler)
+            if _psd_frame_flush_handler in handlers.frame_change_post:
+                handlers.frame_change_post.remove(_psd_frame_flush_handler)
         except Exception:
             pass
+
         try:
-            _remove_handlers_with_name(handlers.frame_change_post, psd_frame_handler.__name__)
+            _remove_handlers_with_name(handlers.frame_change_post, _psd_frame_flush_handler.__name__)
         except Exception:
             pass
 
@@ -2446,7 +2613,7 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     
-
+    register_psd_frame_flush_handler()
     # 触发器
     bpy.types.Object.psd_triggers = CollectionProperty(type=PSDBoneTrigger)
     bpy.types.Object.psd_trigger_index = IntProperty(default=-1)
@@ -2554,18 +2721,22 @@ def register():
     bpy.types.Object.psd_bone_pairs_index = bpy.props.IntProperty(default=0)
 
 def unregister():
+    
     try:
         _remove_handlers_with_name(handlers.depsgraph_update_post, psd_depsgraph_handler.__name__)
     except Exception:
         pass
     try:
-        _remove_handlers_with_name(handlers.frame_change_post, psd_frame_handler.__name__)
+        _remove_handlers_with_name(handlers.frame_change_post, _psd_frame_flush_handler.__name__)
     except Exception:
         pass
+
 
     global _psd_timer_registered, _msgbus_subscribed
     _psd_timer_registered = False
     _unsubscribe_msgbus()
+
+    unregister_psd_frame_flush_handler()
 
     for cls in reversed(classes):
         try:
