@@ -1,6 +1,6 @@
 bl_info = {
     "name": "PSD校正器",
-    "author": "s0lus",
+    "author": "海绵表哥和许多LLM大模型辅助",
     "version": (2, 8),
     "blender": (4, 3, 2),
     "location": "3D视图 > 侧边栏 > PSD",
@@ -31,6 +31,74 @@ last_compute_time = 0.0
 # 性能存储 (内存中, 插件生命周期内有效)
 # -------------------------------
 _psd_perf_stats = {}
+
+
+# ---------- PSD 骨骼状态缓存（用于检测骨骼是否变化） ----------
+_psd_bone_state_cache = {}   # 结构：{ arm_name: { bone_name: (loc_tuple, rot_tuple, sca_tuple) } }
+
+def _psd_make_sample_from_maps(rot_map, loc_map, sca_map, bn, round_ndigits=6):
+    """
+    从 bone_to_cur_rot / bone_to_cur_loc / bone_to_cur_sca 生成一个可比较的 sample。
+    rot_map/loc_map/sca_map 是字典，bn 是骨骼名。
+    返回 (loc_tuple, rot_tuple, sca_tuple)，其中每个子项要么是 tuple 要么是 None。
+    """
+    def _to_tuple(v):
+        if v is None:
+            return None
+        # v 可能是 mathutils.Vector 或 tuple/list
+        try:
+            return tuple(round(float(x), round_ndigits) for x in v)
+        except Exception:
+            try:
+                return tuple(round(float(x), round_ndigits) for x in tuple(v))
+            except Exception:
+                return None
+
+    rot_t = _to_tuple(rot_map.get(bn))
+    loc_t = _to_tuple(loc_map.get(bn))
+    sca_t = _to_tuple(sca_map.get(bn))
+    return (loc_t, rot_t, sca_t)
+
+
+def _psd_samples_equal(s1, s2, eps=1e-5):
+    """
+    比较两个 sample（三元组）。
+    若任一子项为 None 则视为不可比较（返回 False）。
+    eps 是每分量允许的最大差值。
+    """
+    if s1 is None or s2 is None:
+        return False
+    # s1, s2 都应为 (loc_t, rot_t, sca_t)
+    for a, b in zip(s1, s2):
+        if a is None or b is None:
+            return False
+        if len(a) != len(b):
+            return False
+        for va, vb in zip(a, b):
+            if abs(va - vb) > eps:
+                return False
+    return True
+
+
+def psd_invalidate_bone_cache(arm_name=None, bone_name=None):
+    """
+    清空缓存：
+      - psd_invalidate_bone_cache()             -> 清空全部缓存
+      - psd_invalidate_bone_cache(arm_name)     -> 清空某个 arm 的缓存
+      - psd_invalidate_bone_cache(arm_name, bn) -> 清空某个 arm 下的某个骨骼缓存
+    在添加/删除 saved entry、切换 arm、或手动需要强制刷新时调用。
+    """
+    global _psd_bone_state_cache
+    if arm_name is None:
+        _psd_bone_state_cache.clear()
+        return
+    arm_cache = _psd_bone_state_cache.get(arm_name)
+    if not arm_cache:
+        return
+    if bone_name is None:
+        _psd_bone_state_cache.pop(arm_name, None)
+    else:
+        arm_cache.pop(bone_name, None)
 
 # -------------------------------
 # 辅助函数
@@ -650,42 +718,33 @@ class PSD_OT_MoveBonePair(bpy.types.Operator):
 # -------------------------------
 def _psd_compute_all(depsgraph=None):
     """
-    计算所有 armature 的 PSD 结果。
-    对于每个 saved entry，会分别计算 rotation 权重（如原先）与 location 权重（轴向分离线性或球体衰减），
-    并分别写入不同的 datablock key（psd_result_... 与 psd_loc_...）。
-    此处在旋转通道部分新增了基于四元数的摇摆-扭转分解（当条目选择了 rot_channel_mode 且未启用 cone_enabled 时）。
+    计算所有 armature 的 PSD 结果（修正版，包含稳健的骨骼变换检测缓存）。
+    保持权重计算逻辑不变，改变点仅在缓存/跳过未变化骨骼和触发器访问上。
     """
-    global last_compute_time, _psd_perf_stats
+    global last_compute_time, _psd_perf_stats, _psd_bone_state_cache
     current_time = time.time()
 
     # 计算最小间隔：播放时不节流 -> min_interval = 0.0；空闲时读取场景属性 psd_idle_hz
     try:
         sc = bpy.context.scene if (bpy.context and getattr(bpy.context, "scene", None)) else None
         if _is_animation_playing():
-            # 播放时不进行节流（每帧/每次 handler 调用都会运行）
             min_interval = 0.0
         else:
             hz = int(getattr(sc, "psd_idle_hz", 10) or 10)
-            # 限制到合理范围，避免零除或极端值
             if hz < 1:
                 hz = 1
             elif hz > 240:
                 hz = 240
             min_interval = 1.0 / float(hz)
     except Exception:
-        # 回退到原先的 20Hz（0.05s）
         min_interval = 0.05
 
-    # 只有在 min_interval > 0 时才做节流判断
     if min_interval > 0.0:
         if current_time - last_compute_time < min_interval:
             return
-    # 更新上次计算时间（即算过一次就记下时间）
     last_compute_time = current_time
 
-
-
-    # 确定是否收集性能统计信息
+    # perf flag
     perf_enabled = False
     try:
         sc = bpy.context.scene if bpy.context and bpy.context.scene else None
@@ -697,57 +756,118 @@ def _psd_compute_all(depsgraph=None):
 
     t_start_total = time.perf_counter() if perf_enabled else None
 
+    # Debug：临时打开以验证缓存行为（不要长期开启）
+    DEBUG_CACHE = False
+
     for arm in [o for o in bpy.data.objects if o.type == 'ARMATURE']:
         try:
-            saved = getattr(arm, 'psd_saved_poses', None)
-            if not saved:
+            # 可靠的缓存 key（优先 as_pointer()，否则 id(arm)）
+            try:
+                arm_key = arm.as_pointer()
+            except Exception:
+                arm_key = id(arm)
+
+            # 如果旧实现/用户之前的缓存是用 arm.name 保存的，迁移它到 arm_key（一次性）
+            if arm_key not in _psd_bone_state_cache and getattr(arm, "name", None) in _psd_bone_state_cache:
+                try:
+                    _psd_bone_state_cache[arm_key] = _psd_bone_state_cache.pop(arm.name)
+                except Exception:
+                    _psd_bone_state_cache.setdefault(arm_key, {})
+
+            try:
+                saved = getattr(arm, 'psd_saved_poses', None)
+                if not saved:
+                    continue
+            except Exception:
                 continue
 
-            # 从arm.psd_bone_pairs构建筛选集合（如果有）
+            # bone_filter（和你原来逻辑一致）
             bone_filter = None
             try:
                 if getattr(arm, "psd_bone_pairs", None) and len(arm.psd_bone_pairs) > 0:
                     bone_filter = set([p.bone_name for p in arm.psd_bone_pairs if p.bone_name])
             except Exception:
                 bone_filter = None
-
             if bone_filter is None:
                 bone_filter = set(e.bone_name for e in saved if e.bone_name)
 
-            # 预先计算所有相关骨骼的当前旋转和位移（避免重复捕捉）
+            # 预采样：当前旋转/位移/缩放（避免重复捕捉）
             bone_to_cur_rot = {}
             bone_to_cur_loc = {}
             bone_to_cur_sca = {}
             source_obj = arm
-            if depsgraph is not None:
-                try:
+            try:
+                if depsgraph is not None:
                     eval_obj = arm.evaluated_get(depsgraph)
                     if eval_obj:
                         source_obj = eval_obj
-                except Exception:
-                    source_obj = arm
+            except Exception:
+                source_obj = arm
+
             for bn in bone_filter:
+                # 旋转（使用你原有的采样函数）
                 try:
-                    # 旋转 (度)
                     cur_deg = _capture_bone_local_rotation_deg(arm, bn, depsgraph=depsgraph)
-                    bone_to_cur_rot[bn] = Vector(cur_deg)
+                    if cur_deg is not None:
+                        bone_to_cur_rot[bn] = Vector(cur_deg)
                 except Exception:
                     pass
+                # 位移 / 缩放（从评估对象的 pose.bones 取，或原始 arm 的 pose.bones）
                 try:
-                    # 位移：获取当前相对姿态位置 (pb.location)
                     pb = source_obj.pose.bones.get(bn)
                     if pb:
+                        # copy() 保证接下来的比较不会被外部修改影响
                         bone_to_cur_loc[bn] = pb.location.copy()
                         bone_to_cur_sca[bn] = pb.scale.copy()
                 except Exception:
                     pass
 
-            # 为此骨架准备性能统计容器（如果启用）
+            # ----------------- 增加：检测哪些骨骼在本帧没有变化，后面跳过这些骨骼 -----------------
+            arm_cache = _psd_bone_state_cache.setdefault(arm_key, {})
+            skip_bones = set()
+            _PSD_EPS = 1e-5
+            for bn_check in bone_filter:
+                sample = _psd_make_sample_from_maps(bone_to_cur_rot, bone_to_cur_loc, bone_to_cur_sca, bn_check)
+                last_sample = arm_cache.get(bn_check)
+                if sample is not None and last_sample is not None and _psd_samples_equal(sample, last_sample, eps=_PSD_EPS):
+                    skip_bones.add(bn_check)
+                else:
+                    # 仅在可采样时写入缓存，避免写入 None
+                    if sample is not None:
+                        arm_cache[bn_check] = sample
+
+            if DEBUG_CACHE:
+                print(f"[PSD CACHE] arm.name={arm.name} arm_key={arm_key} skip {len(skip_bones)} bones; cached={len(arm_cache)}")
+
+            # ------------------------------------------------------------------------------------
+
+            # ----------------- 修复：排除触发器引用的骨骼，不对它们做跳过优化 -----------------
+            try:
+                trigger_bones = set()
+                # 一定要用原始 arm（不要用 eval_obj）去访问自定义 collection
+                for trig in getattr(arm, "psd_triggers", ()):
+                    # trig.bone_name 是触发器位置来源，trig.target_bone 是被写回结果的目标骨骼
+                    if getattr(trig, "bone_name", None):
+                        trigger_bones.add(trig.bone_name)
+                    if getattr(trig, "target_bone", None):
+                        trigger_bones.add(trig.target_bone)
+                # 从 skip_bones 中去掉触发器相关骨骼（如果它们存在）
+                if trigger_bones:
+                    skip_bones.difference_update(trigger_bones)
+            except Exception:
+                # 忽略任何访问异常，保证稳健性
+                pass
+            # -----------------------------------------------------------------------------
+
+
+            # perf container
             arm_stats = None
             if perf_enabled:
                 arm_stats = _psd_perf_stats.setdefault(arm.name, {"last_total_ms": 0.0, "last_arm_ms": 0.0, "entries": {}})
 
             t_start_arm = time.perf_counter() if perf_enabled else None
+
+            # 遍历 saved entries（按条目计算），但跳过 skip_bones
             for entry in saved:
                 bn = entry.bone_name
                 en = entry.name
@@ -755,85 +875,58 @@ def _psd_compute_all(depsgraph=None):
                     continue
                 if bn not in bone_filter:
                     continue
-                # 如果骨骼未被采样，则跳过
+                # 如果未采样到该骨骼的任何通道则跳过
                 if bn not in bone_to_cur_rot and bn not in bone_to_cur_loc:
                     continue
+                # 跳过本帧被判定为未变化的骨骼
+                if bn in skip_bones:
+                    continue
 
-                # 单个条目性能计时开始
                 t_entry_start = time.perf_counter() if perf_enabled else None
 
-                # Direct channel record (if enabled)
-
+                # ---------------- Direct channel ----------------
                 if getattr(entry, 'is_direct_channel', False):
                     try:
                         key_rot = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
-                        cur_rot = bone_to_cur_rot.get(bn)  # 获取当前旋转
-
-                        # 如果当前旋转没有获取到值，则直接写 0
+                        cur_rot = bone_to_cur_rot.get(bn)
                         if cur_rot is None:
-                            print(f"警告：没有获取到骨骼 {bn} 的旋转数据，写入 0")
                             psd_set_result_datablock_only(arm, key_rot, 0.0, verbose=False)
                         else:
-                            # 获取记录旋转通道模式
                             mode = getattr(entry, 'record_rot_channel_mode', 'NONE')
-
-                            # 获取当前旋转通道的值
                             axis_idx_map = {'X': 0, 'Y': 1, 'Z': 2}
-                            ch_axis = getattr(entry, 'channel_axis', 'X')  # 获取通道轴
-                            axis_idx = axis_idx_map.get(ch_axis, 0)  # 获取对应的轴索引
+                            ch_axis = getattr(entry, 'channel_axis', 'X')
+                            axis_idx = axis_idx_map.get(ch_axis, 0)
                             cur_rot_value = cur_rot[axis_idx]
-
-                            # 获取当前旋转的四元数表示
                             q_cur = _euler_deg_to_quat(tuple(cur_rot))
 
-                            # --- 计算旋转分解：摆动（Swing）和扭转（Twist） ---
                             if mode == 'record_rot_SWING_Y_TWIST':
-                                twist_axis = Vector((0.0, 1.0, 0.0))  # Y 轴为扭转轴
+                                twist_axis = Vector((0.0, 1.0, 0.0))
                                 swing_t, twist_t = _swing_twist_decompose(q_cur, twist_axis)
-
-                                # 计算 W 旋转（摆动角度）
                                 W_cur = math.degrees(2.0 * math.acos(_clamp01(swing_t.w)))
-                                print(f"摆动角度 W_cur: {W_cur}")
-
-                                # 计算扭转角度
                                 cur_twist_angle = _signed_angle_from_quat(twist_t, twist_axis)
-                                print(f"扭转角度 cur_twist_angle: {cur_twist_angle}")
-
-                                # 根据旋转轴选择合适的值来设置权重
-                                if ch_axis == 'Y':  # 如果选中了 Y 轴，则使用扭转角度
+                                if ch_axis == 'Y':
                                     w = _triangular_ratio(cur_twist_angle, W_cur)
-                                else:  # 否则使用摆动角度
+                                else:
                                     w = _triangular_ratio(W_cur, W_cur)
-
                             else:
-                                # 如果没有旋转模式或不需要计算摆动和扭转，直接计算角度
                                 w = cur_rot_value
-                            
-                            # 将角度转换为弧度
+
                             w = math.radians(w)
-                            
-                            # 防止 NaN
                             if math.isnan(w):
                                 w = 0.0
-
-                            # 写入结果
                             psd_set_result_datablock_only(arm, key_rot, w, verbose=False)
-                            print(f"记录通道 {ch_axis} 的旋转值（弧度）: {w}")
-
                     except Exception as e:
-                        print(f"Direct Channel Record 出错: {e}")
                         try:
                             key_rot = f"{PREFIX_RESULT}{_safe_name(bn)}_{_safe_name(en)}"
                             psd_set_result_datablock_only(arm, key_rot, 0.0, verbose=False)
-                        except Exception as e:
-                            print(f"写入失败: {e}")
+                        except Exception:
+                            pass
 
-                # 旋转通道计算（如果存在）
+                # ---------------- Rotation channel ----------------
                 if getattr(entry, 'has_rot', False):
                     try:
                         cur_rot = bone_to_cur_rot.get(bn)
                         if cur_rot is not None:
-                            # 如果启用了 cone_enabled -> 使用原先的锥形方法
                             if getattr(entry, 'cone_enabled', False):
                                 dir_center = _euler_deg_to_dir(entry.pose_rot, entry.cone_axis)
                                 dir_cur = _euler_deg_to_dir(tuple(cur_rot), entry.cone_axis)
@@ -844,50 +937,21 @@ def _psd_compute_all(depsgraph=None):
                                     w = 1.0 - (angle_deg / entry.cone_angle) if entry.cone_angle > 0.0 else 1.0
                                 else:
                                     w = 0.0
-
-                            # 否则，如果用户选择了旋转通道模式 ->
                             elif getattr(entry, 'rot_channel_mode', 'NONE') and entry.rot_channel_mode != 'NONE':
                                 try:
-                                    # 把保存的 rest/pose/current 欧拉都转成四元数
-                                    q_rest = _euler_deg_to_quat(tuple(entry.rest_rot))
-                                    q_pose = _euler_deg_to_quat(tuple(entry.pose_rot))
-                                    q_cur = _euler_deg_to_quat(tuple(cur_rot))
-
-                                    # 计算相对于 rest 的相对旋转
-                                    q_target = q_rest.inverted() @ q_pose
-                                    q_cur_rel = q_rest.inverted() @ q_cur
-
-                                    # 选择扭转轴（局部轴） —— 保留 axis 向量
-                                    axis_map = {
-                                        'SWING_X_TWIST': Vector((1.0, 0.0, 0.0)),
-                                        'SWING_Y_TWIST': Vector((0.0, 1.0, 0.0)),
-                                        'SWING_Z_TWIST': Vector((0.0, 0.0, 1.0)),
-                                    }
-                                    axis = axis_map.get(entry.rot_channel_mode, Vector((0.0, 0.0, 1.0)))
-
-                                    # --- 替换为基于 Euler 分量差的 twist 量（度） ---
+                                    # 保持原算法：用轴分量差做三角包络
                                     axis_idx_map = {'SWING_X_TWIST': 0, 'SWING_Y_TWIST': 1, 'SWING_Z_TWIST': 2}
                                     axis_idx = axis_idx_map.get(entry.rot_channel_mode, 2)
-
-                                    # 注意：entry.rest_rot / entry.pose_rot 是 FloatVectorProperty；cur_rot 来源于采样（Vector）
                                     target_twist_angle = float(entry.pose_rot[axis_idx] - entry.rest_rot[axis_idx])
                                     cur_twist_angle = float(cur_rot[axis_idx] - entry.rest_rot[axis_idx])
-
-                                    # 三角包络映射
                                     w_twist = _triangular_ratio(cur_twist_angle, target_twist_angle)
                                     w = float(max(0.0, min(1.0, w_twist)))
-
-
                                 except Exception:
-                                    # 回退到旧的向量投影法
                                     pose_dir = Vector(entry.pose_rot) - Vector(entry.rest_rot)
                                     cur_rel = Vector(cur_rot) - Vector(entry.rest_rot)
                                     denom = pose_dir.dot(pose_dir)
                                     if denom < 1e-6:
-                                        if cur_rel.length < 1e-3:
-                                            w = 1.0
-                                        else:
-                                            w = 0.0
+                                        w = 1.0 if cur_rel.length < 1e-3 else 0.0
                                     else:
                                         w = cur_rel.dot(pose_dir) / denom
                                         if w < 0.0:
@@ -896,17 +960,12 @@ def _psd_compute_all(depsgraph=None):
                                             w = 0.0
                                         elif w > 1.0:
                                             w = 2.0 - w
-
-                            # 否则使用原始的向量投影法
                             else:
                                 pose_dir = Vector(entry.pose_rot) - Vector(entry.rest_rot)
                                 cur_rel = cur_rot - Vector(entry.rest_rot)
                                 denom = pose_dir.dot(pose_dir)
                                 if denom < 1e-6:
-                                    if cur_rel.length < 1e-3:
-                                        w = 1.0
-                                    else:
-                                        w = 0.0
+                                    w = 1.0 if cur_rel.length < 1e-3 else 0.0
                                 else:
                                     w = cur_rel.dot(pose_dir) / denom
                                     if w < 0.0:
@@ -915,7 +974,6 @@ def _psd_compute_all(depsgraph=None):
                                         w = 0.0
                                     elif w > 1.0:
                                         w = 2.0 - w
-
                             if math.isnan(w):
                                 w = 0.0
                             w = max(0.0, min(1.0, w))
@@ -929,18 +987,16 @@ def _psd_compute_all(depsgraph=None):
                         psd_set_result_datablock_only(arm, key_rot, w, verbose=False)
                     except Exception:
                         pass
-                # 位移通道计算（如果存在）
+
+                # ---------------- Location channel ----------------
                 if getattr(entry, 'has_loc', False):
                     try:
                         cur_loc = bone_to_cur_loc.get(bn)
                         if cur_loc is not None:
                             center = Vector(entry.pose_loc)
                             radius = float(getattr(entry, 'loc_radius', 0.0) or 0.0)
-
-                            # 如果 loc_enabled 为 True -> 使用逐轴线性衰减（原始方法）
                             if getattr(entry, 'loc_enabled', False):
                                 if radius <= 0.0:
-                                    # 需要精确匹配
                                     w_loc = 1.0 if (cur_loc - center).length < 1e-6 else 0.0
                                 else:
                                     d = cur_loc - center
@@ -949,44 +1005,28 @@ def _psd_compute_all(depsgraph=None):
                                     wz = max(0.0, 1.0 - abs(d.z) / radius)
                                     w_loc = wx * wy * wz
                             else:
-                                # 修改版：逐轴类PSD衰减，忽略pose_loc[i]≈0的轴
                                 w_loc = 1.0
                                 num_nonzero = 0
-
-                                # 取出rest与pose（都应以 tuple/list 存在 entry）
                                 rest_vec = Vector(getattr(entry, 'rest_loc', (0.0, 0.0, 0.0)))
                                 pose_vec = Vector(getattr(entry, 'pose_loc', (0.0, 0.0, 0.0)))
-                                # 使用向量投影来计算一个整体的权重 w_loc
                                 direction = pose_vec - rest_vec
                                 len2 = direction.length_squared
-
                                 if len2 < 1e-12:
-                                    # pose 与 rest 几乎相同，退回到距离精确匹配判断
                                     w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
                                 else:
-                                    # t 是 cur 在 rest->pose 线段上的比例（可以小于0或大于1）
                                     t = (cur_loc - rest_vec).dot(direction) / len2
-
                                     if math.isnan(t):
                                         t = 0.0
-
-                                    # 原逻辑映射： <0 ->0 ; >2 ->0 ; 1..2 -> 2 - t ; 0..1 -> t
                                     if t < 0.0 or t > 2.0:
                                         w_loc = 0.0
                                     elif t > 1.0:
                                         w_loc = 2.0 - t
                                     else:
                                         w_loc = t
-
-                                    # 稳定化
                                     w_loc = max(0.0, min(1.0, w_loc))
-
                                     num_nonzero += 1
-
-                                # 如果所有轴都被视为“几乎不可判定”（num_nonzero==0），则退回到精确匹配判断
                                 if num_nonzero == 0:
                                     w_loc = 1.0 if (cur_loc - rest_vec).length < 1e-6 else 0.0
-
                             if math.isnan(w_loc):
                                 w_loc = 0.0
                             w_loc = max(0.0, min(1.0, w_loc))
@@ -1001,38 +1041,28 @@ def _psd_compute_all(depsgraph=None):
                     except Exception:
                         pass
 
-                # 缩放通道计算（如果存在）
+                # ---------------- Scale channel ----------------
                 if getattr(entry, 'has_sca', False):
                     try:
                         cur_sca = bone_to_cur_sca.get(bn)
                         if cur_sca is not None:
-                            # 使用向量投影来计算一个整体的权重 w_sca（类似于位置的非衰减模式）
                             rest_vec = Vector(getattr(entry, 'rest_sca', (1.0, 1.0, 1.0)))
                             pose_vec = Vector(getattr(entry, 'pose_sca', (1.0, 1.0, 1.0)))
                             direction = pose_vec - rest_vec
                             len2 = direction.length_squared
-
                             if len2 < 1e-12:
-                                # pose 与 rest 几乎相同，退回到精确匹配判断
                                 w_sca = 1.0 if (cur_sca - rest_vec).length < 1e-6 else 0.0
                             else:
-                                # t 是 cur 在 rest->pose 线段上的比例（可以小于0或大于1）
                                 t = (cur_sca - rest_vec).dot(direction) / len2
-
                                 if math.isnan(t):
                                     t = 0.0
-
-                                # 原逻辑映射： <0 ->0 ; >2 ->0 ; 1..2 -> 2 - t ; 0..1 -> t
                                 if t < 0.0 or t > 2.0:
                                     w_sca = 0.0
                                 elif t > 1.0:
                                     w_sca = 2.0 - t
                                 else:
                                     w_sca = t
-
-                                # 稳定化
                                 w_sca = max(0.0, min(1.0, w_sca))
-
                             if math.isnan(w_sca):
                                 w_sca = 0.0
                             w_sca = max(0.0, min(1.0, w_sca))
@@ -1047,57 +1077,39 @@ def _psd_compute_all(depsgraph=None):
                     except Exception:
                         pass
 
-
-                # ---------- 触发器计算 ----------
-                # 参数：arm = 当前 armature object
-                if hasattr(arm, "psd_triggers"):
-                    for trig in arm.psd_triggers:
+                # ---------- 触发器计算（总是用原始 arm） ----------
+                orig_arm = arm
+                if getattr(orig_arm, "psd_triggers", None):
+                    for trig in orig_arm.psd_triggers:
                         trig.last_weight = 0.0
                         if not trig.enabled:
                             continue
-                        # 骨骼存在性检查
-                        try:
-                            pb_trigger = arm.pose.bones.get(trig.bone_name)
-                            pb_target = arm.pose.bones.get(trig.target_bone)
-                        except Exception:
-                            pb_trigger = None
-                            pb_target = None
+                        pb_trigger = orig_arm.pose.bones.get(trig.bone_name)
+                        pb_target = orig_arm.pose.bones.get(trig.target_bone)
                         if not pb_trigger or not pb_target:
                             continue
-
-                        # 世界坐标下的骨骼头坐标
                         try:
-                            head_trigger_world = arm.matrix_world @ pb_trigger.head
-                            head_target_world = arm.matrix_world @ pb_target.head
+                            head_trigger_world = orig_arm.matrix_world @ pb_trigger.head
+                            head_target_world = orig_arm.matrix_world @ pb_target.head
                         except Exception:
-                            # 兼容不同 blender 版本的 API（如果 pb.head 不可用）
-                            head_trigger_world = arm.matrix_world @ pb_trigger.bone.head_local
-                            head_target_world = arm.matrix_world @ pb_target.bone.head_local
+                            head_trigger_world = orig_arm.matrix_world @ pb_trigger.bone.head_local
+                            head_target_world = orig_arm.matrix_world @ pb_target.bone.head_local
 
                         d = (head_target_world - head_trigger_world).length
                         r = max(1e-6, float(trig.radius))
-                        # 选择衰减类型
                         if trig.falloff == 'SMOOTH':
-                            # smoothstep: 3t^2 - 2t^3 on normalized distance t = clamp(d/r,0,1)
                             t = min(max(d / r, 0.0), 1.0)
                             w = 1.0 - (3.0 * t * t - 2.0 * t * t * t)
-                            # since when d=0 => t=0 => w=1; when d>=r => t>=1 => w=0
                         else:
-                            # 线性：w = clamp(1 - d/r, 0, 1)
                             w = max(0.0, min(1.0, 1.0 - d / r))
-
                         trig.last_weight = w
-
-                        # 将结果写回 Armature 自定义属性，便于调试或其他模块访问
-                        bn = trig.target_bone or ""
-                        en = trig.name or ""
-                        key_base = f"{PREFIX_RESULT_LOC}{_safe_name(bn)}_{_safe_name(en)}"
+                        key_base = f"{PREFIX_RESULT_LOC}{_safe_name(trig.target_bone)}_{_safe_name(trig.name)}"
                         try:
-                            psd_set_result_datablock_only(arm, f"{key_base}_w", float(w), verbose=False)
+                            psd_set_result_datablock_only(orig_arm, f"{key_base}_w", float(w), verbose=False)
                         except Exception:
                             pass
-                      
-                # 记录此条目的性能（毫秒）
+
+                # 性能记录
                 if perf_enabled:
                     t_entry_end = time.perf_counter()
                     dt_ms = max(0.0, (t_entry_end - t_entry_start) * 1000.0) if t_entry_start else 0.0
@@ -1118,7 +1130,7 @@ def _psd_compute_all(depsgraph=None):
                         hist.pop(0)
                     ent_stats["avg_ms"] = (sum(hist) / len(hist)) if hist else 0.0
 
-            # 记录骨架处理时间
+            # arm perf
             if perf_enabled:
                 t_end_arm = time.perf_counter()
                 arm_ms = max(0.0, (t_end_arm - t_start_arm) * 1000.0) if t_start_arm else 0.0
@@ -1127,7 +1139,7 @@ def _psd_compute_all(depsgraph=None):
         except Exception as e:
             print('PSD计算骨架时出错', getattr(arm, "name", "<unknown>"), e)
 
-    # 记录总时间
+    # total perf
     if perf_enabled:
         t_end_total = time.perf_counter()
         total_ms = max(0.0, (t_end_total - t_start_total) * 1000.0) if t_start_total else 0.0
@@ -1985,6 +1997,19 @@ class PSDSavedPoseUIList(bpy.types.UIList):
 
         return filtered, new_order
 
+class PSD_OT_invalidate_cache(bpy.types.Operator):
+    bl_idname = "psd.invalidate_bone_cache"
+    bl_label = "Invalidate PSD Bone Cache"
+
+    def execute(self, context):
+        obj = context.object
+        if obj and obj.type == 'ARMATURE':
+            psd_invalidate_bone_cache(obj.name)
+            self.report({'INFO'}, f"Cleared PSD cache for {obj.name}")
+        else:
+            psd_invalidate_bone_cache()
+            self.report({'INFO'}, "Cleared all PSD caches")
+        return {'FINISHED'}
 
 # -------------------------------
 # UI 面板 (带位移控件和性能调试)
@@ -2275,6 +2300,7 @@ class PSDPanel(bpy.types.Panel):
             row.operator('object.psd_start', icon='PLAY', text='启动')
 
         layout.label(text='(姿态数据保存在骨架上；结果写入骨架数据块)', icon='INFO')
+        layout.operator("psd.invalidate_bone_cache", icon='FILE_REFRESH', text='清缓存')
 
 # -------------------------------
 # 注册
@@ -2413,6 +2439,7 @@ classes = [
     PSD_OT_RemoveTrigger,
     PSD_OT_SelectTriggerBone,
     PSDCaptureScaleRest, PSDCaptureScale, PSDSaveCapturedScaleEntry,
+    PSD_OT_invalidate_cache,
 ]
 
 def register():
@@ -2549,7 +2576,7 @@ def unregister():
     for p in ('psd_temp_rest','psd_temp_pose','psd_temp_rest_bone','psd_temp_pose_bone',
               'psd_temp_loc_rest','psd_temp_loc','psd_temp_loc_rest_bone','psd_temp_loc_bone',
               'psd_running','psd_mode','psd_idle_hz','psd_perf_enabled','psd_perf_history_len','psd_show_results','psd_results_search','psd_results_sort_by','psd_results_sort_reverse','psd_results_limit',
-              'psd_temp_sca_rest','psd_temp_sca','psd_temp_sca_rest_bone','psd_temp_sca_bone','psd_show_captures','psd_show_triggers','psd_show_saved_poses'):
+              'psd_temp_sca_rest','psd_temp_sca','psd_temp_sca_rest_bone','psd_temp_sca_bone','psd_show_captures','psd_show_triggers','psd_show_saved_poses','PSD_OT_invalidate_cache'):
         try:
             delattr(bpy.types.Scene, p)
         except Exception:
