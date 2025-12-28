@@ -2,7 +2,7 @@ import math
 from mathutils import Vector, Euler, Quaternion
 
 def _euler_deg_to_dir(rot_deg, axis='Z'):
-    # 原脚本中 _euler_deg_to_dir 函数完整复制
+    
     ex, ey, ez = rot_deg
     e = Euler((math.radians(ex), math.radians(ey), math.radians(ez)), 'XYZ')
     mat = e.to_matrix()
@@ -18,12 +18,12 @@ def _euler_deg_to_dir(rot_deg, axis='Z'):
     return dir_vec.normalized()
 
 def _euler_deg_to_quat(rot_deg):
-    # 原脚本中 _euler_deg_to_quat 函数完整复制
+    
     ex, ey, ez = rot_deg
     return Euler((math.radians(ex), math.radians(ey), math.radians(ez)), 'XYZ').to_quaternion()
 
 def _swing_twist_decompose(q: Quaternion, twist_axis: Vector):
-    # 原脚本中 _swing_twist_decompose 函数完整复制
+    
     if twist_axis.length == 0:
         return q.copy(), Quaternion((1.0, 0.0, 0.0, 0.0))
     axis = twist_axis.normalized()
@@ -38,7 +38,7 @@ def _swing_twist_decompose(q: Quaternion, twist_axis: Vector):
     return swing, twist
 
 def _signed_angle_from_quat(q: Quaternion, axis: Vector):
-    # 原脚本中 _signed_angle_from_quat 函数完整复制
+    
     q = q.copy()
     if q.w < 0:
         q.negate()
@@ -48,7 +48,7 @@ def _signed_angle_from_quat(q: Quaternion, axis: Vector):
     return sign * math.degrees(theta)
 
 def _triangular_ratio(cur, target):
-    # 原脚本中 _triangular_ratio 函数完整复制
+    
     if target is None:
         return 0.0
     if abs(target) < 1e-6:
