@@ -1,7 +1,12 @@
 import bpy
-from .core import _psd_perf_stats  # 导入性能统计
 from .utils import _get_selected_pair_bone  # 导入辅助
 from .operators import PREFIX_RESULT, PREFIX_RESULT_LOC, PREFIX_RESULT_SCA
+from .core import (
+    _psd_perf_stats,
+    _shape_expressions_cache,
+    _pose_drivers_cache,
+    _arm_key_for_obj
+)
 
 class PSDBonePairUIList(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -94,6 +99,22 @@ class PSDBoneTriggerUIList(bpy.types.UIList):
             layout.label(text=item.name)
 
 
+class PSDShapeDriverFileUIList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.prop(item, "filepath", text="", emboss=False)
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
+class PSDPoseDriverFileUIList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            layout.prop(item, "filepath", text="", emboss=False)
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="")
+
 
 class PSDPanel(bpy.types.Panel):
     bl_label = "PSD校正器"
@@ -123,6 +144,102 @@ class PSDPanel(bpy.types.Panel):
         col.separator()
         col.operator('psd.move_bone_pair', icon='TRIA_UP', text='').direction = 'UP'
         col.operator('psd.move_bone_pair', icon='TRIA_DOWN', text='').direction = 'DOWN'
+
+        # # ---- 新增：缓存 Empty UI（从 scene 里选择）
+        # box = layout.box()
+        # box.label(text="PSD 缓存对象 (Empty)", icon='EMPTY_AXIS')
+        # row = box.row(align=True)
+        # # 显示场景中选择的对象（用户在下拉里选择）：
+        # row.prop(context.scene, "psd_cache_empty", text="")
+        # col = row.column(align=True)
+        # col.operator("psd.register_cache_empty_ui", icon='CHECKMARK', text="注册")
+        # col.operator("psd.unregister_cache_empty_ui", icon='X', text="取消注册")
+
+        # # # 显示当前 armature 上已注册的缓存（如果有）
+        # # arm_db = None
+        # # try:
+        # #     arm_db = bpy.data.armatures.get(arm.data.name)
+        # # except Exception:
+        # #     arm_db = None
+        # # registered_name = ""
+        # # if arm_db:
+        # #     registered_name = arm_db.get("_psd_cache_obj", "") or ""
+        # # row2 = box.row()
+        # # row2.label(text=f"当前已注册: {registered_name or '<未设置>'}", icon='INFO')
+        # # # ---- 结束新增
+
+        # ==== 新增：PSD 输出模式设置 ====
+        box = layout.box()
+        box.label(text="PSD 输出模式", icon='DRIVER')
+
+        row = box.row()
+        row.prop(arm, "psd_output_mode", text="")
+
+        # Shape Driver 文件列表
+        # row.template_list("PSDShapeDriverFileUIList", "", scene, "psd_shape_driver_files", scene, "psd_shape_driver_files_index", rows=4)
+
+        # # Pose Driver 文件列表
+        # row.template_list("PSDPoseDriverFileUIList", "", scene, "psd_pose_driver_files", scene, "psd_pose_driver_files_index", rows=4)
+
+        sub = box.box()
+
+        if arm.psd_output_mode == 'STORE_TO_EMPTY':
+            sub.label(text="PSD 结果将存储到注册的 Empty（同时应用 Shape/Pose Drivers）", icon='EMPTY_AXIS')
+            row = sub.row(align=True)
+            row.prop(context.scene, "psd_cache_empty", text="")
+            col = row.column(align=True)
+            col.operator("psd.register_cache_empty_ui", icon='CHECKMARK', text="注册")
+            col.operator("psd.unregister_cache_empty_ui", icon='X', text="取消注册")
+
+            # 显示当前注册状态
+            registered_name = "<未设置>"
+            try:
+                arm_db = bpy.data.armatures.get(arm.data.name)
+                if arm_db:
+                    registered_name = arm_db.get("_psd_cache_obj", "") or "<未设置>"
+            except:
+                pass
+            row2 = sub.row()
+            row2.label(text=f"当前注册 Empty: {registered_name}", icon='INFO')
+
+        elif arm.psd_output_mode == 'APPLY_DRIVERS':
+            sub.label(text="仅根据 JSON Drivers 将 PSD 结果应用到 Shape Keys 和骨骼约束（不存储原始结果）", icon='SHAPEKEY_DATA')
+            
+            arm_key = _arm_key_for_obj(arm)
+            
+            shape_expressions = _shape_expressions_cache.get(arm_key, {})
+            shape_count = len(shape_expressions)
+            
+            pose_drivers = _pose_drivers_cache.get(arm_key, {})
+            pose_count = sum(len(prop_dict) for constraint_dict in pose_drivers.values() for prop_dict in constraint_dict.values()) if pose_drivers else 0
+            
+            sub.label(text=f"• 当前骨架已加载 Shape Driver 条数: {shape_count}")
+            sub.label(text=f"• 当前骨架已加载 Pose Driver 条数: {pose_count}")
+            sub.label(text="（JSON 文件列表为场景全局；数量为当前选中骨架的实际加载结果）", icon='INFO')
+            # ======
+
+            # ==== Shape Driver JSON 文件管理 ====
+            box = layout.box()
+            box.label(text="Shape Driver JSON 文件（beta）", icon='SHAPEKEY_DATA')
+            row = box.row(align=True)
+            row.template_list("PSDShapeDriverFileUIList", "", arm, "psd_shape_driver_files", arm, "psd_shape_driver_files_index", rows=4)
+            col = row.column(align=True)
+            col.operator("psd.add_shape_driver_file", icon='ADD', text="")
+            col.operator("psd.remove_shape_driver_file", icon='REMOVE', text="")
+            col.separator()
+            col.operator("psd.reload_shape_drivers", icon='FILE_REFRESH', text="Reload")
+
+            # ==== Pose Driver JSON 文件管理 ====
+            box = layout.box()
+            box.label(text="Pose Driver JSON 文件（beta）", icon='CONSTRAINT_BONE')
+            row = box.row(align=True)
+            row.template_list("PSDPoseDriverFileUIList", "", arm, "psd_pose_driver_files", arm, "psd_pose_driver_files_index", rows=4)
+            col = row.column(align=True)
+            col.operator("psd.add_pose_driver_file", icon='ADD', text="")
+            col.operator("psd.remove_pose_driver_file", icon='REMOVE', text="")
+            col.separator()
+            col.operator("psd.reload_pose_drivers", icon='FILE_REFRESH', text="Reload")
+
 
         # 配置导出/导入
         box = layout.box()
@@ -249,7 +366,7 @@ class PSDPanel(bpy.types.Panel):
                         if e.cone_enabled:
                             subbox.prop(e, 'cone_angle', text='锥角 (度)')
                             subbox.prop(e, 'cone_axis', text='轴向')
-                        subbox.prop(e, 'rot_channel_mode', text='旋转通道模式')
+                        # subbox.prop(e, 'rot_channel_mode', text='旋转通道模式')
 
                     subbox.separator()
                     # 位置详情

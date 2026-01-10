@@ -21,18 +21,18 @@ class PSDSavedPose(bpy.types.PropertyGroup):
     rest_rot: bpy.props.FloatVectorProperty(name="静止旋转 (度)", size=3, default=(0.0,0.0,0.0))
     pose_rot: bpy.props.FloatVectorProperty(name="姿态旋转 (度)", size=3, default=(0.0,0.0,0.0))
     has_rot: bpy.props.BoolProperty(name="包含旋转", default=False)
-    # 新增：旋转通道模式（参考 Blender 驱动器的 "旋转通道模式"）
-    rot_channel_mode: bpy.props.EnumProperty(
-        name="旋转通道模式",
-        description="使用摇摆+扭转分解来计算权重（若非 'NONE' 且未启用锥形衰减时生效）",
-        items=[
-            ('NONE', "默认", "不使用通道模式 (保持原先的向量投影法)") ,
-            ('SWING_X_TWIST', "only X 扭转", "将 X 轴作为扭转轴"),
-            ('SWING_Y_TWIST', "only Y 扭转", "将 Y 轴作为扭转轴"),
-            ('SWING_Z_TWIST', "only Z 扭转", "将 Z 轴作为扭转轴"),
-        ],
-        default='NONE'
-    )
+    # 没什么用
+    # rot_channel_mode: bpy.props.EnumProperty(
+    #     name="旋转通道模式",
+    #     description="使用摇摆+扭转分解来计算权重（若非 'NONE' 且未启用锥形衰减时生效）",
+    #     items=[
+    #         ('NONE', "默认", "不使用通道模式 (保持原先的向量投影法)") ,
+    #         ('SWING_X_TWIST', "only X 扭转", "将 X 轴作为扭转轴"),
+    #         ('SWING_Y_TWIST', "only Y 扭转", "将 Y 轴作为扭转轴"),
+    #         ('SWING_Z_TWIST', "only Z 扭转", "将 Z 轴作为扭转轴"),
+    #     ],
+    #     default='NONE'
+    # )
 
     # 旋转的锥形衰减 (现有行为)
     cone_enabled: bpy.props.BoolProperty(name="锥形衰减", default=False)
@@ -85,6 +85,19 @@ class PSDBoneTrigger(bpy.types.PropertyGroup):
     # 运行时结果（只读供 UI 显示），不会被序列化为复杂对象，但会保存为小数
     last_weight: bpy.props.FloatProperty(name="Last Weight", default=0.0)
 
+class PSDShapeDriverFile(bpy.types.PropertyGroup):
+    filepath: bpy.props.StringProperty(
+        name="JSON File",
+        subtype='FILE_PATH',
+        description="Shape Driver JSON 文件路径"
+    )
+
+class PSDPoseDriverFile(bpy.types.PropertyGroup):
+    filepath: bpy.props.StringProperty(
+        name="JSON File",
+        subtype='FILE_PATH',
+        description="Pose Driver JSON 文件路径"
+    )
 
 def register_props():
     # 注册属性到 bpy.types.Object 和 bpy.types.Scene
@@ -187,6 +200,22 @@ def register_props():
         max=5000
     )
 
+    bpy.types.Object.psd_output_mode = bpy.props.EnumProperty(
+        name="PSD 输出模式",
+        description="选择 PSD 计算结果的处理方式",
+        items=[
+            ('STORE_TO_EMPTY', "存储到 Empty", "将 PSD 结果存储到注册的 Empty（同时应用 Drivers）"),
+            ('APPLY_DRIVERS', "仅应用 Drivers", "只根据 JSON Drivers 将结果应用到模型（不存储原始结果）"),
+        ],
+        default='STORE_TO_EMPTY'
+    )
+
+# === 新增：全局（Scene）Shape Driver 和 Pose Driver JSON 文件列表 ===
+    bpy.types.Object.psd_shape_driver_files = bpy.props.CollectionProperty(type=PSDShapeDriverFile)
+    bpy.types.Object.psd_shape_driver_files_index = bpy.props.IntProperty(default=-1)
+
+    bpy.types.Object.psd_pose_driver_files = bpy.props.CollectionProperty(type=PSDPoseDriverFile)
+    bpy.types.Object.psd_pose_driver_files_index = bpy.props.IntProperty(default=-1)
 
 def unregister_props():
     # 删除属性（反向操作）
@@ -207,7 +236,9 @@ def unregister_props():
     for p in ('psd_temp_rest','psd_temp_pose','psd_temp_rest_bone','psd_temp_pose_bone',
               'psd_temp_loc_rest','psd_temp_loc','psd_temp_loc_rest_bone','psd_temp_loc_bone',
               'psd_running','psd_mode','psd_idle_hz','psd_perf_enabled','psd_perf_history_len','psd_show_results','psd_results_search','psd_results_sort_by','psd_results_sort_reverse','psd_results_limit',
-              'psd_temp_sca_rest','psd_temp_sca','psd_temp_sca_rest_bone','psd_temp_sca_bone','psd_show_captures','psd_show_triggers','psd_show_saved_poses','PSD_OT_invalidate_cache'):
+              'psd_temp_sca_rest','psd_temp_sca','psd_temp_sca_rest_bone','psd_temp_sca_bone','psd_show_captures','psd_show_triggers','psd_show_saved_poses','PSD_OT_invalidate_cache',
+              "psd_output_mode","psd_shape_driver_files","psd_shape_driver_files_index",
+              "psd_pose_driver_files","psd_pose_driver_files_index"):
         try:
             delattr(bpy.types.Scene, p)
         except Exception:

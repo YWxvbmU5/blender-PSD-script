@@ -3,7 +3,7 @@ import json
 import os
 import math
 from bpy_extras.io_utils import ImportHelper, ExportHelper
-from .utils import _safe_name, _get_selected_pair_bone, _capture_bone_local_rotation_deg, _capture_bone_local_translation, _capture_bone_local_scale  # 导入依赖
+from .utils import _safe_name, _get_selected_pair_bone, _capture_bone_local_rotation_deg, _capture_bone_local_translation, _capture_bone_local_scale, psd_register_cache_empty, psd_unregister_cache_empty  # 导入依赖
 from .core import psd_invalidate_bone_cache  # 导入核心函数
 from .utils import PREFIX_RESULT, PREFIX_RESULT_LOC, PREFIX_RESULT_SCA
 
@@ -902,8 +902,46 @@ class PSDRecordChannelZ(bpy.types.Operator):
             self.report({'ERROR'}, f"记录失败: {ex}")
             return {'CANCELLED'}
 
-# 其他所有 Operator，如 PSDImportConfig, PSDCaptureRest, PSDSaveCapturedRotationEntry, PSDRemoveSavedEntry, PSD_OT_AddTrigger 等
-# ... (完整复制所有 Operator 类，从 "class PSDExportConfig" 到文件末尾的 Operator)
+class PSD_OT_register_cache_empty_ui(bpy.types.Operator):
+    bl_idname = "psd.register_cache_empty_ui"
+    bl_label = "PSD: 注册缓存 Empty (UI)"
+    bl_description = "使用面板中选择的 Empty 将其注册为当前激活的 Armature 的 PSD 缓存"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = context.object
+        empty = getattr(context.scene, "psd_cache_empty", None)
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先激活一个 Armature 对象")
+            return {'CANCELLED'}
+        if not empty or empty.type != 'EMPTY':
+            self.report({'ERROR'}, "请在面板中选择一个 Empty 作为缓存对象")
+            return {'CANCELLED'}
+        ok = psd_register_cache_empty(arm, empty, verbose=True)
+        if not ok:
+            self.report({'ERROR'}, "注册失败（检查控制台）")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"已将 Empty '{empty.name}' 注册到骨架 '{arm.name}'")
+        return {'FINISHED'}
+
+class PSD_OT_unregister_cache_empty_ui(bpy.types.Operator):
+    bl_idname = "psd.unregister_cache_empty_ui"
+    bl_label = "PSD: 取消注册缓存 Empty (UI)"
+    bl_description = "取消当前激活 Armature 上的 PSD 缓存 Empty 注册"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先激活一个 Armature 对象")
+            return {'CANCELLED'}
+        ok = psd_unregister_cache_empty(arm, verbose=True)
+        if not ok:
+            self.report({'ERROR'}, "取消注册失败或未设置（检查控制台）")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "已取消注册")
+        return {'FINISHED'}
+
 
 class PSD_OT_invalidate_cache(bpy.types.Operator):
     bl_idname = "psd.invalidate_bone_cache"
@@ -917,4 +955,94 @@ class PSD_OT_invalidate_cache(bpy.types.Operator):
         else:
             psd_invalidate_bone_cache()
             self.report({'INFO'}, "Cleared all PSD caches")
+        return {'FINISHED'}
+    
+# Shape Driver 对应操作器
+class PSDAddShapeDriverFile(bpy.types.Operator, ImportHelper):
+    bl_idname = "psd.add_shape_driver_file"
+    bl_label = "添加 Shape Driver JSON"
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架对象")
+            return {'CANCELLED'}
+        item = arm.psd_shape_driver_files.add()
+        item.filepath = self.filepath
+        arm.psd_shape_driver_files_index = len(arm.psd_shape_driver_files) - 1
+        self.report({'INFO'}, f"已添加 Shape Driver 文件: {os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+
+class PSDRemoveShapeDriverFile(bpy.types.Operator):
+    bl_idname = "psd.remove_shape_driver_file"
+    bl_label = "移除选中 Shape Driver JSON"
+
+    def execute(self, context):
+        arm = context.object
+        idx = arm.psd_shape_driver_files_index
+        if 0 <= idx < len(arm.psd_shape_driver_files):
+            arm.psd_shape_driver_files.remove(idx)
+            arm.psd_shape_driver_files_index = max(0, idx - 1)
+            self.report({'INFO'}, "已移除选中文件")
+        return {'FINISHED'}
+
+class PSDReloadShapeDrivers(bpy.types.Operator):
+    bl_idname = "psd.reload_shape_drivers"
+    bl_label = "重新加载 Shape Drivers"
+
+    def execute(self, context):
+        from .core import reload_shape_drivers  # 延迟导入避免循环
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架对象")
+            return {'CANCELLED'}
+        count = reload_shape_drivers(arm)
+        self.report({'INFO'}, f"重新加载 Shape Drivers: {count} 条")
+        return {'FINISHED'}
+
+# Pose Driver 对应操作器（几乎相同）
+class PSDAddPoseDriverFile(bpy.types.Operator, ImportHelper):
+    bl_idname = "psd.add_pose_driver_file"
+    bl_label = "添加 Pose Driver JSON"
+    filename_ext = ".json"
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架对象")
+            return {'CANCELLED'}
+        item = arm.psd_pose_driver_files.add()
+        item.filepath = self.filepath
+        arm.psd_pose_driver_files_index = len(arm.psd_pose_driver_files) - 1
+        self.report({'INFO'}, f"已添加 Pose Driver 文件: {os.path.basename(self.filepath)}")
+        return {'FINISHED'}
+
+class PSDRemovePoseDriverFile(bpy.types.Operator):
+    bl_idname = "psd.remove_pose_driver_file"
+    bl_label = "移除选中 Pose Driver JSON"
+
+    def execute(self, context):
+        arm = context.object
+        idx = arm.psd_pose_driver_files_index
+        if 0 <= idx < len(arm.psd_pose_driver_files):
+            arm.psd_pose_driver_files.remove(idx)
+            arm.psd_pose_driver_files_index = max(0, idx - 1)
+            self.report({'INFO'}, "已移除选中文件")
+        return {'FINISHED'}
+
+class PSDReloadPoseDrivers(bpy.types.Operator):
+    bl_idname = "psd.reload_pose_drivers"
+    bl_label = "重新加载 Pose Drivers"
+
+    def execute(self, context):
+        from .core import reload_pose_drivers  # 延迟导入
+        arm = context.object
+        if not arm or arm.type != 'ARMATURE':
+            self.report({'ERROR'}, "请先选择一个骨架对象")
+            return {'CANCELLED'}
+        count = reload_pose_drivers(arm)
+        self.report({'INFO'}, f"重新加载 Pose Drivers: {count} 条")
         return {'FINISHED'}

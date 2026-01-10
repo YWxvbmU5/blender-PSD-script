@@ -132,7 +132,7 @@ def psd_frame_handler(scene):
 
 
 @handlers.persistent
-def psd_depsgraph_handler(depsgraph):
+def psd_depsgraph_handler(scene,depsgraph):
     try:
         sc = bpy.context.scene if bpy.context and bpy.context.scene else None
         if sc and getattr(sc, 'psd_mode', 'AUTO') == 'FORCE_TIMER':
