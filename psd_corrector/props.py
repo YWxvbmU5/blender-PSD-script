@@ -217,6 +217,12 @@ def register_props():
     bpy.types.Object.psd_pose_driver_files = bpy.props.CollectionProperty(type=PSDPoseDriverFile)
     bpy.types.Object.psd_pose_driver_files_index = bpy.props.IntProperty(default=-1)
 
+    bpy.types.Object.show_psd_settings = bpy.props.BoolProperty(
+        name="显示 PSD 输出设置",
+        description="展开或折叠 PSD 输出详细设置",
+        default=False
+    )
+
 def unregister_props():
     # 删除属性（反向操作）
     try:
@@ -238,7 +244,7 @@ def unregister_props():
               'psd_running','psd_mode','psd_idle_hz','psd_perf_enabled','psd_perf_history_len','psd_show_results','psd_results_search','psd_results_sort_by','psd_results_sort_reverse','psd_results_limit',
               'psd_temp_sca_rest','psd_temp_sca','psd_temp_sca_rest_bone','psd_temp_sca_bone','psd_show_captures','psd_show_triggers','psd_show_saved_poses','PSD_OT_invalidate_cache',
               "psd_output_mode","psd_shape_driver_files","psd_shape_driver_files_index",
-              "psd_pose_driver_files","psd_pose_driver_files_index"):
+              "psd_pose_driver_files","psd_pose_driver_files_index","show_psd_settings"):
         try:
             delattr(bpy.types.Scene, p)
         except Exception:
